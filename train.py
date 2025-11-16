@@ -493,7 +493,7 @@ class SelfPlayTrainer:
                 if enc.shape[0] == 0:
                     break
                 # Forward on GPU
-        with torch.no_grad():
+                with torch.no_grad():
                     x = torch.from_numpy(np.asarray(enc, dtype=np.float32))
                     x = x.to(self.device, non_blocking=True)
                     vals = self.model(x).squeeze()  # [T]
