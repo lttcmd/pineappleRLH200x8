@@ -550,9 +550,7 @@ class SelfPlayTrainer:
         episodes_per_train_step = 32  # Train less frequently to keep episode throughput high
         
         episode_idx = 0
-        # Hybrid schedule: deterministic 70/30 split (7 random batches, then 3 policy)
-        target_random_fraction = 0.70  # display/help text
-        batch_counter = 0
+        # Throughput-first: 100% random batches for maximum hands/sec
         while start_episode + episode_idx < num_episodes:
             # Calculate how many episodes to generate in this batch
             remaining = num_episodes - (start_episode + episode_idx)
@@ -561,9 +559,9 @@ class SelfPlayTrainer:
             # Calculate absolute episode number
             absolute_episode = start_episode + episode_idx
             
-            # 70/30 hybrid: deterministic per 10 batches for consistency
-            use_random_for_batch = (batch_counter % 10) < 7
-            random_prob = 0.70
+            # Always random to maximize throughput
+            use_random_for_batch = True
+            random_prob = 1.0
             
             # Generate batch of episodes
             if use_random_for_batch:
@@ -585,15 +583,8 @@ class SelfPlayTrainer:
                 if current_ep:  # Add remaining
                     episodes_list.append(current_ep)
             else:
-                # Parallel net-based episodes via centralized GPU action server
-                episodes_parallel = self.generate_episodes_parallel_with_server(
-                    num_episodes=batch_size_current,
-                    base_seed=absolute_episode * 2000
-                )
-                episodes_list = [ep for ep in episodes_parallel if ep]
-            
-            # Increment batch counter
-            batch_counter += 1
+                # Unused in 100% random mode
+                episodes_list = []
             
             
             # Process each episode
