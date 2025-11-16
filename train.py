@@ -70,6 +70,74 @@ def _generate_episode_worker(seed: int) -> List[Tuple[State, float]]:
     return [(s, final_score) for s in episode_states]
 
 
+def _generate_episode_with_net_worker(args: Tuple[int, dict]) -> List[Tuple[State, float]]:
+    """
+    Worker function to generate one episode using the value network in a separate process.
+    The model weights are passed in via state_dict and loaded on CPU in the worker.
+    """
+    seed, model_state_dict = args
+
+    # Set random seeds for this worker
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    # Create environment and model (CPU for worker-side inference)
+    env = OfcEnv()
+    state = env.reset()
+
+    input_dim = get_input_dim()
+    model = ValueNet(input_dim, hidden_dim=512)
+    model.load_state_dict(model_state_dict)
+    device = torch.device("cpu")
+    model = model.to(device)
+    model.eval()
+
+    episode_states: List[State] = []
+
+    while True:
+        # Get legal actions
+        legal_actions = env.legal_actions(state)
+
+        if not legal_actions:
+            episode_states.append(state)
+            break
+
+        # Save current state BEFORE stepping
+        episode_states.append(state)
+
+        # Simulate all actions and evaluate with the value network
+        next_states = []
+        valid_actions = []
+        for action in legal_actions:
+            next_state, _, _ = env.step(state, action)
+            next_states.append(next_state)
+            valid_actions.append(action)
+
+        encoded_batch = encode_state_batch(next_states).to(device)
+
+        with torch.no_grad():
+            values = model(encoded_batch).squeeze()
+            if values.dim() == 0:
+                best_idx = 0
+            else:
+                best_idx = values.argmax().item()
+
+        best_action = valid_actions[best_idx]
+
+        # Step environment with chosen action
+        state, _, done = env.step(state, best_action)
+
+        if done:
+            episode_states.append(state)
+            break
+
+    # Compute final score
+    final_score = env.score(state)
+
+    return [(s, final_score) for s in episode_states]
+
+
 class SelfPlayTrainer:
     """Manages self-play training for the value network."""
     
@@ -176,18 +244,26 @@ class SelfPlayTrainer:
         Returns:
             List of all (state, final_score) pairs from all episodes
         """
-        if not use_random or num_episodes < 4:
-            # Fall back to sequential generation for non-random or small batches
+        if num_episodes < 4:
+            # Fall back to sequential generation for very small batches
             all_data = []
             for i in range(num_episodes):
                 episode_data = self.generate_episode(use_random=use_random, env_idx=i)
                 all_data.extend(episode_data)
             return all_data
-        
+
         # Generate episodes in parallel using multiprocessing
         seeds = [base_seed + i for i in range(num_episodes)]
-        episode_results = self.pool.map(_generate_episode_worker, seeds)
-        
+
+        if use_random:
+            # Random-policy episodes (no network)
+            episode_results = self.pool.map(_generate_episode_worker, seeds)
+        else:
+            # Network-based episodes: pass a CPU copy of the model weights to workers
+            model_state_dict = {k: v.detach().cpu() for k, v in self.model.state_dict().items()}
+            worker_args = [(seed, model_state_dict) for seed in seeds]
+            episode_results = self.pool.map(_generate_episode_with_net_worker, worker_args)
+
         # Flatten results
         all_data = []
         for episode_data in episode_results:
@@ -366,28 +442,28 @@ class SelfPlayTrainer:
             if use_random_for_batch:
                 # Parallel generation for random episodes
                 all_episode_data = self.generate_episodes_parallel(
-                    batch_size_current, 
+                    batch_size_current,
                     use_random=True,
                     base_seed=absolute_episode * 1000
                 )
-                
-                # Split into individual episodes (each episode ~13 states)
-                episodes_list = []
-                current_ep = []
-                for state, score in all_episode_data:
-                    current_ep.append((state, score))
-                    if len(current_ep) >= 13:  # OFC typically has ~13 placements
-                        episodes_list.append(current_ep)
-                        current_ep = []
-                if current_ep:  # Add remaining
-                    episodes_list.append(current_ep)
             else:
-                # Sequential generation for network-based episodes
-                episodes_list = []
-                for i in range(batch_size_current):
-                    episode_data = self.generate_episode(use_random=False, env_idx=absolute_episode + i)
-                    if episode_data:
-                        episodes_list.append(episode_data)
+                # Parallel generation for network-based episodes
+                all_episode_data = self.generate_episodes_parallel(
+                    batch_size_current,
+                    use_random=False,
+                    base_seed=absolute_episode * 1000
+                )
+
+            # Split into individual episodes (each episode ~13 states)
+            episodes_list = []
+            current_ep = []
+            for state, score in all_episode_data:
+                current_ep.append((state, score))
+                if len(current_ep) >= 13:  # OFC typically has ~13 placements
+                    episodes_list.append(current_ep)
+                    current_ep = []
+            if current_ep:  # Add remaining
+                episodes_list.append(current_ep)
             
             # Process each episode
             for episode_data in episodes_list:
