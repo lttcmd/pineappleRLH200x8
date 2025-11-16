@@ -31,6 +31,12 @@ py::array_t<float> encode_state_batch_ints(py::array_t<int16_t> boards,  // (N,1
                                            py::array_t<int16_t> deck_sizes); // (N,)
 // Episode generator
 py::tuple generate_random_episodes(uint64_t seed, int num_episodes);
+// Engine APIs
+uint64_t create_engine(uint64_t seed);
+void destroy_engine(uint64_t handle);
+void engine_start_envs(uint64_t handle, int num_envs);
+py::tuple request_policy_batch(uint64_t handle, int max_candidates_per_env);
+int apply_policy_actions(uint64_t handle, py::array_t<int32_t> chosen);
 
 PYBIND11_MODULE(ofc_cpp, m) {
   m.doc() = "C++ accelerated OFC helpers";
@@ -59,6 +65,18 @@ PYBIND11_MODULE(ofc_cpp, m) {
   m.def("generate_random_episodes", &generate_random_episodes,
         py::arg("seed"), py::arg("num_episodes"),
         "Generate random episodes end-to-end and return (encoded_states [S,838], episode_offsets [E+1], final_scores [E]).");
+
+  // Engine bindings
+  m.def("create_engine", &create_engine, py::arg("seed"),
+        "Create a multi-env engine; returns handle (uint64).");
+  m.def("destroy_engine", &destroy_engine, py::arg("handle"),
+        "Destroy engine by handle.");
+  m.def("engine_start_envs", &engine_start_envs, py::arg("handle"), py::arg("num_envs"),
+        "Initialize N environments inside engine.");
+  m.def("request_policy_batch", &request_policy_batch, py::arg("handle"), py::arg("max_candidates_per_env"),
+        "Return (encoded_candidates [T,838], meta [T,3] int32: env_id, action_id, candidate_idx).");
+  m.def("apply_policy_actions", &apply_policy_actions, py::arg("handle"), py::arg("chosen"),
+        "Apply chosen actions array [N,2] int32 of (env_id, action_id). Returns number stepped.");
 }
 
 

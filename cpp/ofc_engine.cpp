@@ -5,6 +5,7 @@
 #include <random>
 #include <algorithm>
 #include <cstdint>
+#include <unordered_map>
 
 namespace py = pybind11;
 
@@ -33,6 +34,281 @@ py::array_t<float> encode_state_batch_ints(py::array_t<int16_t> boards,
 static void init_deck(std::vector<int16_t>& deck) {
   deck.resize(52);
   for (int i=0;i<52;++i) deck[i] = static_cast<int16_t>(i);
+}
+
+// ----------------- Phase 2: Simple multi-env engine -----------------
+struct EnvState {
+  std::array<int16_t,13> board;
+  std::array<int16_t,3> draw3;
+  std::vector<int16_t> deck;
+  int round_idx;
+  bool done;
+  // Cache of last candidate actions for apply step: (kp0,kp1,p00,p01,p10,p11) or round0 as card_idx mapped to slot via p01, p11 ignored
+  std::vector<std::array<int32_t,6>> last_actions;
+};
+
+struct Engine {
+  std::mt19937_64 rng;
+  std::vector<EnvState> envs;
+  Engine(uint64_t seed) : rng(seed) {}
+};
+
+static std::unordered_map<uint64_t, Engine*> g_engines;
+static uint64_t g_next_handle = 1;
+
+static uint64_t create_engine(uint64_t seed) {
+  uint64_t h = g_next_handle++;
+  g_engines[h] = new Engine(seed);
+  return h;
+}
+
+static void destroy_engine(uint64_t handle) {
+  auto it = g_engines.find(handle);
+  if (it!=g_engines.end()) {
+    delete it->second;
+    g_engines.erase(it);
+  }
+}
+
+static void engine_start_envs(uint64_t handle, int num_envs) {
+  auto it = g_engines.find(handle);
+  if (it==g_engines.end()) throw std::runtime_error("invalid engine handle");
+  Engine* eng = it->second;
+  eng->envs.clear();
+  eng->envs.resize(num_envs);
+  for (int e=0;e<num_envs;++e) {
+    EnvState& st = eng->envs[e];
+    st.board.fill(-1);
+    st.draw3 = {-1,-1,-1};
+    st.deck.clear();
+    init_deck(st.deck);
+    std::shuffle(st.deck.begin(), st.deck.end(), eng->rng);
+    // deal 5
+    std::array<int16_t,5> initial5{};
+    for (int i=0;i<5;++i){ initial5[i]=st.deck.back(); st.deck.pop_back(); }
+    // round 0: set board empty; draw is initial5 carried via special step
+    // We'll not store initial5 explicitly; use legal_actions_round0/step_state_round0 in request function
+    // Store initial5 into draw3 temporarily unused; keep round 0 marker
+    st.round_idx = 0;
+    st.done = false;
+    st.last_actions.clear();
+    // Encode initial5 into draw3's first three and push remaining two onto deck front to retrieve in request
+    st.draw3 = {initial5[0], initial5[1], initial5[2]};
+    // push the remaining two back to deck head in order so request can reconstruct
+    st.deck.insert(st.deck.begin(), initial5[4]);
+    st.deck.insert(st.deck.begin(), initial5[3]);
+  }
+}
+
+// Build candidates for all active envs up to max_candidates_per_env.
+// Returns (encoded_candidates [T,838] float32, meta [T,3] int32: env_id, action_id, candidate_idx)
+static py::tuple request_policy_batch(uint64_t handle, int max_candidates_per_env) {
+  auto it = g_engines.find(handle);
+  if (it==g_engines.end()) throw std::runtime_error("invalid engine handle");
+  Engine* eng = it->second;
+  // Collect per-candidate raw state to encode
+  std::vector<int16_t> boards_all;
+  std::vector<int8_t> rounds_all;
+  std::vector<int16_t> draws_all;
+  std::vector<int16_t> deck_sizes_all;
+  std::vector<int32_t> meta; // triples
+
+  for (int env_id=0; env_id<(int)eng->envs.size(); ++env_id) {
+    EnvState& st = eng->envs[env_id];
+    if (st.done) continue;
+    st.last_actions.clear();
+    // assemble board and deck arrays
+    auto b_np = py::array_t<int16_t>({13});
+    auto b_m = b_np.mutable_unchecked<1>();
+    for (int i=0;i<13;++i) b_m(i)=st.board[i];
+    int produced = 0;
+    if (st.round_idx == 0) {
+      // Generate round0 placements
+      py::array_t<int16_t> placements = legal_actions_round0(b_np);
+      int total = (int)placements.shape(0);
+      auto P = placements.unchecked<3>();
+      // reconstruct initial5 from st.draw3 and first two of deck head
+      std::array<int16_t,5> initial5{st.draw3[0], st.draw3[1], st.draw3[2], st.deck[0], st.deck[1]};
+      for (int k=0; k<total && produced<max_candidates_per_env; ++k) {
+        // Build step to get next state
+        auto c5 = py::array_t<int16_t>({5});
+        auto c5m = c5.mutable_unchecked<1>();
+        for (int i=0;i<5;++i) c5m(i)=initial5[i];
+        auto d_np = py::array_t<int16_t>({(ssize_t)st.deck.size()});
+        auto d_m = d_np.mutable_unchecked<1>();
+        for (ssize_t i=0;i<(ssize_t)st.deck.size();++i) d_m(i)=st.deck[i];
+        auto sl_np = py::array_t<int16_t>({5});
+        auto sl_m = sl_np.mutable_unchecked<1>();
+        for (int i=0;i<5;++i) sl_m(i)=P(k,i,1);
+        py::tuple res = step_state_round0(b_np, c5, d_np, sl_np);
+        auto b2 = res[0].cast<py::array_t<int16_t>>();
+        int new_round = res[1].cast<int>();
+        auto draw_next = res[2].cast<py::array_t<int16_t>>();
+        auto d2 = res[3].cast<py::array_t<int16_t>>();
+        auto b2r = b2.unchecked<1>();
+        auto dr = draw_next.unchecked<1>();
+        auto d2r = d2.unchecked<1>();
+        // record encoding inputs
+        for (int i=0;i<13;++i) boards_all.push_back(b2r(i));
+        rounds_all.push_back((int8_t)new_round);
+        for (int i=0;i<3;++i) draws_all.push_back(dr(i));
+        deck_sizes_all.push_back((int16_t)d2r.shape(0));
+        meta.push_back(env_id); meta.push_back((int32_t)st.last_actions.size()); meta.push_back(produced);
+        // store action (encode as round0 sentinel with kp = -1, put slots in p01,p11 etc. we store five slot indices by overloading: we will replay via step_state_round0 again during apply)
+        // We cannot store 5 slots in our 6-field struct; store k (index into placements), and mark kp0=-2
+        st.last_actions.push_back({-2, k, 0,0,0,0});
+        produced++;
+      }
+    } else {
+      // rounds 1..4
+      py::tuple acts = legal_actions_rounds1to4(b_np, st.round_idx);
+      auto keeps = acts[0].cast<py::array_t<int8_t>>();
+      auto places = acts[1].cast<py::array_t<int16_t>>();
+      int total = (int)keeps.shape(0);
+      auto K = keeps.unchecked<2>();
+      auto P = places.unchecked<3>();
+      // draw array
+      auto draw_np = py::array_t<int16_t>({3});
+      auto draw_m = draw_np.mutable_unchecked<1>();
+      for (int i=0;i<3;++i) draw_m(i)=st.draw3[i];
+      // deck np
+      auto d_np = py::array_t<int16_t>({(ssize_t)st.deck.size()});
+      auto d_m = d_np.mutable_unchecked<1>();
+      for (ssize_t i=0;i<(ssize_t)st.deck.size();++i) d_m(i)=st.deck[i];
+      for (int k=0; k<total && produced<max_candidates_per_env; ++k) {
+        int keep_i = K(k,0), keep_j=K(k,1);
+        int p00=P(k,0,0), p01=P(k,0,1);
+        int p10=P(k,1,0), p11=P(k,1,1);
+        py::tuple res = step_state(b_np, st.round_idx, draw_np, d_np, keep_i, keep_j, p00, p01, p10, p11);
+        auto b2 = res[0].cast<py::array_t<int16_t>>();
+        int new_round = res[1].cast<int>();
+        auto draw_next = res[2].cast<py::array_t<int16_t>>();
+        auto d2 = res[3].cast<py::array_t<int16_t>>();
+        auto b2r = b2.unchecked<1>();
+        auto dr = draw_next.unchecked<1>();
+        auto d2r = d2.unchecked<1>();
+        for (int i=0;i<13;++i) boards_all.push_back(b2r(i));
+        rounds_all.push_back((int8_t)new_round);
+        for (int i=0;i<3;++i) draws_all.push_back(dr(i));
+        deck_sizes_all.push_back((int16_t)d2r.shape(0));
+        meta.push_back(env_id); meta.push_back((int32_t)st.last_actions.size()); meta.push_back(produced);
+        st.last_actions.push_back({keep_i, keep_j, p00, p01, p10, p11});
+        produced++;
+      }
+    }
+  }
+
+  // Pack encoding inputs
+  ssize_t T = rounds_all.size();
+  if (T==0) {
+    // return empty
+    auto enc = py::array_t<float>({0, (ssize_t)838});
+    auto meta_np = py::array_t<int32_t>({0, (ssize_t)3});
+    return py::make_tuple(enc, meta_np);
+  }
+  py::array_t<int16_t> boards_np({T, (ssize_t)13});
+  py::array_t<int8_t> rounds_np({T});
+  py::array_t<int16_t> draws_np({T, (ssize_t)3});
+  py::array_t<int16_t> deck_np({T});
+  {
+    auto B = boards_np.mutable_unchecked<2>();
+    auto R = rounds_np.mutable_unchecked<1>();
+    auto D = draws_np.mutable_unchecked<2>();
+    auto L = deck_np.mutable_unchecked<1>();
+    ssize_t ib=0, id=0;
+    for (ssize_t t=0;t<T;++t) {
+      for (int i=0;i<13;++i) B(t,i)=boards_all[ib++];
+      R(t)=rounds_all[t];
+      for (int i=0;i<3;++i) D(t,i)=draws_all[id++];
+      L(t)=deck_sizes_all[t];
+    }
+  }
+  py::array_t<float> encoded = encode_state_batch_ints(boards_np, rounds_np, draws_np, deck_np);
+  py::array_t<int32_t> meta_np({T, (ssize_t)3});
+  {
+    auto M = meta_np.mutable_unchecked<2>();
+    for (ssize_t t=0;t<T;++t) {
+      M(t,0)=meta[t*3+0];
+      M(t,1)=meta[t*3+1];
+      M(t,2)=meta[t*3+2];
+    }
+  }
+  return py::make_tuple(encoded, meta_np);
+}
+
+// chosen: [N,2] int32 of (env_id, action_id_index)
+// Returns number of envs stepped
+static int apply_policy_actions(uint64_t handle, py::array_t<int32_t> chosen) {
+  auto it = g_engines.find(handle);
+  if (it==g_engines.end()) throw std::runtime_error("invalid engine handle");
+  Engine* eng = it->second;
+  auto C = chosen.unchecked<2>();
+  int N = (int)C.shape(0);
+  int stepped = 0;
+  for (int i=0;i<N;++i) {
+    int env_id = C(i,0);
+    int action_id = C(i,1);
+    if (env_id<0 || env_id>=(int)eng->envs.size()) continue;
+    EnvState& st = eng->envs[env_id];
+    if (st.done) continue;
+    if (action_id<0 || action_id>=(int)st.last_actions.size()) continue;
+    // Build arrays
+    auto b_np = py::array_t<int16_t>({13});
+    auto b_m = b_np.mutable_unchecked<1>();
+    for (int k=0;k<13;++k) b_m(k)=st.board[k];
+    auto d_np = py::array_t<int16_t>({(ssize_t)st.deck.size()});
+    auto d_m = d_np.mutable_unchecked<1>();
+    for (ssize_t k=0;k<(ssize_t)st.deck.size();++k) d_m(k)=st.deck[k];
+    auto act = st.last_actions[action_id];
+    if (st.round_idx == 0 && act[0]==-2) {
+      // Retrieve placements index and reconstruct initial5
+      int kidx = act[1];
+      py::array_t<int16_t> placements = legal_actions_round0(b_np);
+      if (kidx < 0 || kidx >= (int)placements.shape(0)) continue;
+      auto P = placements.unchecked<3>();
+      auto sl_np = py::array_t<int16_t>({5});
+      auto sl_m = sl_np.mutable_unchecked<1>();
+      for (int j=0;j<5;++j) sl_m(j)=P(kidx,j,1);
+      std::array<int16_t,5> initial5{st.draw3[0], st.draw3[1], st.draw3[2], st.deck[0], st.deck[1]};
+      auto c5 = py::array_t<int16_t>({5});
+      auto c5m = c5.mutable_unchecked<1>();
+      for (int j=0;j<5;++j) c5m(j)=initial5[j];
+      py::tuple res = step_state_round0(b_np, c5, d_np, sl_np);
+      auto b2 = res[0].cast<py::array_t<int16_t>>();
+      int new_round = res[1].cast<int>();
+      auto draw_next = res[2].cast<py::array_t<int16_t>>();
+      auto d2 = res[3].cast<py::array_t<int16_t>>();
+      bool done = res[4].cast<bool>();
+      auto b2r = b2.unchecked<1>(); for (int j=0;j<13;++j) st.board[j]=b2r(j);
+      auto d2r = d2.unchecked<1>(); st.deck.resize(d2r.shape(0)); for (ssize_t j=0;j<d2r.shape(0);++j) st.deck[j]=d2r(j);
+      auto dr = draw_next.unchecked<1>(); for (int j=0;j<3;++j) st.draw3[j]=dr(j);
+      st.round_idx = new_round;
+      st.done = done;
+      stepped++;
+    } else {
+      // rounds 1..4
+      auto draw_np = py::array_t<int16_t>({3});
+      auto draw_m = draw_np.mutable_unchecked<1>();
+      for (int j=0;j<3;++j) draw_m(j)=st.draw3[j];
+      int keep_i = (int)act[0], keep_j=(int)act[1];
+      int p00=(int)act[2], p01=(int)act[3], p10=(int)act[4], p11=(int)act[5];
+      py::tuple res = step_state(b_np, st.round_idx, draw_np, d_np, keep_i, keep_j, p00, p01, p10, p11);
+      auto b2 = res[0].cast<py::array_t<int16_t>>();
+      int new_round = res[1].cast<int>();
+      auto draw_next = res[2].cast<py::array_t<int16_t>>();
+      auto d2 = res[3].cast<py::array_t<int16_t>>();
+      bool done = res[4].cast<bool>();
+      auto b2r = b2.unchecked<1>(); for (int j=0;j<13;++j) st.board[j]=b2r(j);
+      auto d2r = d2.unchecked<1>(); st.deck.resize(d2r.shape(0)); for (ssize_t j=0;j<d2r.shape(0);++j) st.deck[j]=d2r(j);
+      auto dr = draw_next.unchecked<1>(); for (int j=0;j<3;++j) st.draw3[j]=dr(j);
+      st.round_idx = new_round;
+      st.done = done;
+      stepped++;
+    }
+    // Clear last actions to force new request on next cycle
+    st.last_actions.clear();
+  }
+  return stepped;
 }
 
 // Generate random episodes end-to-end and return encoded states
