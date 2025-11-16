@@ -550,6 +550,9 @@ class SelfPlayTrainer:
         episodes_per_train_step = 32  # Train less frequently to keep episode throughput high
         
         episode_idx = 0
+        # Hybrid schedule: 99 random batches, 1 policy batch
+        policy_every_n_batches = 100
+        batch_counter = 0
         while start_episode + episode_idx < num_episodes:
             # Calculate how many episodes to generate in this batch
             remaining = num_episodes - (start_episode + episode_idx)
@@ -558,11 +561,9 @@ class SelfPlayTrainer:
             # Calculate absolute episode number
             absolute_episode = start_episode + episode_idx
             
-            # Hybrid mode: gradually reduce randomness so the model learns more over time.
-            # Start near 100% random, anneal toward 10% random by the end.
-            progress = (absolute_episode - start_episode) / max(1, (num_episodes - start_episode))
-            random_prob = max(0.10, 1.0 - progress / 0.9)  # ~100% -> 10% over 90% of training
-            use_random_for_batch = (random.random() < random_prob)
+            # 99/1 hybrid: use policy every Nth batch, random otherwise
+            use_random_for_batch = (batch_counter % policy_every_n_batches) != 0
+            random_prob = 1.0 if use_random_for_batch else 0.0
             
             # Generate batch of episodes
             if use_random_for_batch:
@@ -590,6 +591,9 @@ class SelfPlayTrainer:
                     base_seed=absolute_episode * 2000
                 )
                 episodes_list = [ep for ep in episodes_parallel if ep]
+            
+            # Increment batch counter after generation
+            batch_counter += 1
             
             # Process each episode
             for episode_data in episodes_list:
