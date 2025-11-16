@@ -263,9 +263,9 @@ class SelfPlayTrainer:
         # Engine-policy settings (Phase 2)
         self.use_engine_policy = _USE_ENGINE_POLICY and (_CPP is not None)
         # Configure default engine parameters
-        self.engine_num_envs = max(32, min(256, self.num_workers))  # spawn many envs
-        self.engine_max_candidates = 64
-        self.engine_cycles = 200  # request/apply cycles per run
+        self.engine_num_envs = max(64, min(256, self.num_workers))  # more envs
+        self.engine_max_candidates = 128  # explore more actions
+        self.engine_cycles = 300  # push episodes further per run
     
     def generate_episode(self, use_random: bool = True, env_idx: int = 0) -> List[Tuple[State, float]]:
         """
@@ -557,7 +557,13 @@ class SelfPlayTrainer:
         # Forward pass
         self.optimizer.zero_grad()
         predictions = self.model(state_batch)
-        loss = self.criterion(predictions, targets)
+        # Weighted MSE: emphasize avoiding fouls (negative targets) and rewarding high scores
+        with torch.no_grad():
+            neg_mask = (targets < 0).float()
+            high_mask = (targets > 5.0).float()
+            weights = 1.0 + 0.5 * neg_mask + 0.25 * high_mask
+        mse_per = (predictions - targets) ** 2
+        loss = (mse_per * weights).mean()
         
         # Backward pass
         loss.backward()
@@ -943,9 +949,8 @@ def main():
     )
     
     try:
-        # Train for millions of hands
-        # Resume from latest checkpoint and target 5 million total hands
-        num_episodes = 500_000_000
+        # Fresh 10,000,000-hand run
+        num_episodes = 10_000_000
         
         trainer.train(
             num_episodes=num_episodes,
