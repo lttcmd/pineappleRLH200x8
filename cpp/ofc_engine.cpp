@@ -557,10 +557,13 @@ py::tuple generate_random_episodes(uint64_t seed, int num_episodes) {
   }
   py::array_t<float> encoded = encode_state_batch_ints(boards_np, rounds_np, draws_np, deck_np);
   // Create offsets array - ensure we copy values correctly
+  // CRITICAL: Copy offsets vector values explicitly to avoid any potential view/reference issues
   py::array_t<int32_t> offs({(ssize_t)offsets.size()});
   auto O = offs.mutable_unchecked<1>();
+  // Explicitly copy each value to ensure no reference/view issues
   for (ssize_t i=0;i<(ssize_t)offsets.size();++i) {
-    O(i) = static_cast<int32_t>(offsets[i]);
+    int32_t val = offsets[i];  // Explicit copy of value
+    O(i) = val;
   }
   py::array_t<float> scores({(ssize_t)final_scores.size()});
   auto Sarr = scores.mutable_unchecked<1>();
