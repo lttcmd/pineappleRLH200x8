@@ -10,6 +10,12 @@ from ofc_types import Card, Rank, Suit
 from ofc_scoring import validate_board, score_board
 
 
+# Heuristic caps to reduce CPU branching during action generation
+MAX_INITIAL_PERMUTATIONS = 12           # cap for round-0 permutations (was 24)
+MAX_EMPTY_SLOTS_CONSIDERED = 8          # consider at most this many empty slots per decision
+MAX_SLOT_COMBOS_PER_PAIR = 6            # cap for (slot_i, slot_j) pairs per kept card pair (was 15)
+
+
 @dataclass
 class State:
     """Represents the current game state."""
@@ -101,14 +107,23 @@ class OfcEnv:
             if len(empty_slots) < 5:
                 return []  # Invalid state
             
-            # Drastically reduced permutations - only generate first 24 (was 120, then 60)
+            # Optionally subsample empty slots to reduce branching
+            if len(empty_slots) > MAX_EMPTY_SLOTS_CONSIDERED:
+                # Randomly sample to add diversity
+                import random as _rand
+                empty_slots = _rand.sample(empty_slots, MAX_EMPTY_SLOTS_CONSIDERED)
+                # Ensure we still have at least 5
+                if len(empty_slots) < 5:
+                    empty_slots = [i for i in range(13) if state.board[i] is None]
+            
+            # Reduced permutations - generate only a capped number (was 24)
             count = 0
             for perm in permutations(range(5)):
-                if count >= 24:  # Minimal permutations for maximum speed
-                    break
                 placements = [(card_idx, empty_slots[i]) for i, card_idx in enumerate(perm)]
                 legal.append(Action(keep_indices=tuple(range(5)), placements=placements))
                 count += 1
+                if count >= MAX_INITIAL_PERMUTATIONS:
+                    break
         else:
             # Rounds 1-4: choose 2 of 3 cards
             empty_slots = [i for i in range(13) if state.board[i] is None]
@@ -116,15 +131,23 @@ class OfcEnv:
             if len(empty_slots) < 2:
                 return []  # Board is full
             
+            # Subsample empty slots considered to keep combinations small
+            if len(empty_slots) > MAX_EMPTY_SLOTS_CONSIDERED:
+                import random as _rand
+                empty_slots = _rand.sample(empty_slots, MAX_EMPTY_SLOTS_CONSIDERED)
+            
             # Choose 2 of 3 cards (3 combinations: (0,1), (0,2), (1,2))
             for keep in combinations(range(3), 2):
                 # For each pair of cards, try placing them in empty slots
-                # Further limit slot combinations for maximum speed
-                slot_combos = list(combinations(empty_slots, 2))
-                for slot_pair in slot_combos[:min(len(slot_combos), 15)]:  # Reduced from 20 to 15
-                    # Both orderings
+                # Iterate combinations without materializing full list; cap per pair
+                pair_count = 0
+                for slot_pair in combinations(empty_slots, 2):
+                    # Add both orderings to preserve some symmetry
                     legal.append(Action(keep_indices=keep, placements=[(0, slot_pair[0]), (1, slot_pair[1])]))
                     legal.append(Action(keep_indices=keep, placements=[(1, slot_pair[0]), (0, slot_pair[1])]))
+                    pair_count += 1
+                    if pair_count >= MAX_SLOT_COMBOS_PER_PAIR:
+                        break
         
         return legal
     
