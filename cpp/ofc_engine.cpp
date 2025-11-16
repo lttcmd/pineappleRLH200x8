@@ -56,13 +56,13 @@ struct Engine {
 static std::unordered_map<uint64_t, Engine*> g_engines;
 static uint64_t g_next_handle = 1;
 
-static uint64_t create_engine(uint64_t seed) {
+uint64_t create_engine(uint64_t seed) {
   uint64_t h = g_next_handle++;
   g_engines[h] = new Engine(seed);
   return h;
 }
 
-static void destroy_engine(uint64_t handle) {
+void destroy_engine(uint64_t handle) {
   auto it = g_engines.find(handle);
   if (it!=g_engines.end()) {
     delete it->second;
@@ -70,7 +70,7 @@ static void destroy_engine(uint64_t handle) {
   }
 }
 
-static void engine_start_envs(uint64_t handle, int num_envs) {
+void engine_start_envs(uint64_t handle, int num_envs) {
   auto it = g_engines.find(handle);
   if (it==g_engines.end()) throw std::runtime_error("invalid engine handle");
   Engine* eng = it->second;
@@ -102,7 +102,7 @@ static void engine_start_envs(uint64_t handle, int num_envs) {
 
 // Build candidates for all active envs up to max_candidates_per_env.
 // Returns (encoded_candidates [T,838] float32, meta [T,3] int32: env_id, action_id, candidate_idx)
-static py::tuple request_policy_batch(uint64_t handle, int max_candidates_per_env) {
+py::tuple request_policy_batch(uint64_t handle, int max_candidates_per_env) {
   auto it = g_engines.find(handle);
   if (it==g_engines.end()) throw std::runtime_error("invalid engine handle");
   Engine* eng = it->second;
@@ -238,7 +238,7 @@ static py::tuple request_policy_batch(uint64_t handle, int max_candidates_per_en
 
 // chosen: [N,2] int32 of (env_id, action_id_index)
 // Returns number of envs stepped
-static int apply_policy_actions(uint64_t handle, py::array_t<int32_t> chosen) {
+int apply_policy_actions(uint64_t handle, py::array_t<int32_t> chosen) {
   auto it = g_engines.find(handle);
   if (it==g_engines.end()) throw std::runtime_error("invalid engine handle");
   Engine* eng = it->second;
