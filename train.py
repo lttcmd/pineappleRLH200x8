@@ -266,6 +266,10 @@ class SelfPlayTrainer:
         self.engine_num_envs = max(64, min(256, self.num_workers))  # more envs
         self.engine_max_candidates = 128  # explore more actions
         self.engine_cycles = 300  # push episodes further per run
+        # Hybrid exploration schedule
+        self.random_phase_episodes = 2_000_000        # 100% random for first 2M hands
+        self.anneal_phase_episodes = 3_000_000        # linearly anneal over next 3M
+        self.min_random_prob = 0.15                   # keep at least 15% random thereafter
     
     def generate_episode(self, use_random: bool = True, env_idx: int = 0) -> List[Tuple[State, float]]:
         """
@@ -674,9 +678,22 @@ class SelfPlayTrainer:
             # Calculate absolute episode number
             absolute_episode = start_episode + episode_idx
             
-            # Always random to maximize throughput
-            use_random_for_batch = not self.use_engine_policy
-            random_prob = 0.0 if self.use_engine_policy else 1.0
+            # Hybrid exploration schedule
+            if self.use_engine_policy:
+                # Determine random probability based on progress (absolute episode count)
+                if absolute_episode < self.random_phase_episodes:
+                    random_prob = 1.0
+                elif absolute_episode < (self.random_phase_episodes + self.anneal_phase_episodes):
+                    t = (absolute_episode - self.random_phase_episodes) / max(1, self.anneal_phase_episodes)
+                    # 1.0 -> min_random_prob linearly
+                    random_prob = 1.0 - t * (1.0 - self.min_random_prob)
+                else:
+                    random_prob = self.min_random_prob
+                # Stochastic choice per batch
+                use_random_for_batch = (np.random.rand() < random_prob)
+            else:
+                use_random_for_batch = True
+                random_prob = 1.0
             
             # Generate batch of episodes
             if use_random_for_batch:
