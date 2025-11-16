@@ -231,6 +231,14 @@ class SelfPlayTrainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() and use_cuda else "cpu")
         self.model = self.model.to(self.device)
         self.model.train()
+        # Enable TF32 where available (H100/H200): improves GEMM throughput
+        try:
+            if self.device.type == "cuda":
+                import torch.backends.cuda as _bkc, torch.backends.cudnn as _bkcu
+                _bkc.matmul.allow_tf32 = True
+                _bkcu.allow_tf32 = True
+        except Exception:
+            pass
         
         print(f"Using device: {self.device}")
         if self.device.type == "cuda":
@@ -271,6 +279,34 @@ class SelfPlayTrainer:
         self.engine_num_envs = _ENGINE_NUM_ENVS if _ENGINE_NUM_ENVS > 0 else default_envs
         self.engine_max_candidates = _ENGINE_MAX_CAND if _ENGINE_MAX_CAND > 0 else 64
         self.engine_cycles = _ENGINE_CYCLES if _ENGINE_CYCLES > 0 else 200  # request/apply cycles per run
+        # Parallel engines
+        self.engine_workers = max(1, self.num_workers) if self.use_engine_policy else 0
+        # Aggregation batch size for GPU forwards
+        self.engine_batch_agg = int(os.getenv("OFC_ENGINE_BATCH_AGG", "16384"))
+
+    # -------- Parallel Engine Workers --------
+    @staticmethod
+    def _engine_worker_loop(worker_id: int, seed: int, num_envs: int, max_cand: int, cycles: int,
+                            request_q: Queue, response_q: Queue, out_q: Queue):
+        import numpy as _np
+        import ofc_cpp as _cpp
+        h = _cpp.create_engine(_np.uint64(seed))
+        try:
+            _cpp.engine_start_envs(h, int(num_envs))
+            for _ in range(int(cycles)):
+                enc, meta = _cpp.request_policy_batch(h, int(max_cand))
+                if enc.shape[0] == 0:
+                    break
+                request_q.put((worker_id, enc, meta))
+                # Wait for chosen actions for this worker
+                chosen = response_q.get()
+                if chosen is None or len(chosen) == 0:
+                    break
+                _cpp.apply_policy_actions(h, chosen)
+            enc2, offs, scores = _cpp.engine_collect_encoded_episodes(h)
+            out_q.put((worker_id, enc2, offs, scores))
+        finally:
+            _cpp.destroy_engine(h)
     
     def generate_episode(self, use_random: bool = True, env_idx: int = 0) -> List[Tuple[State, float]]:
         """
@@ -788,54 +824,118 @@ class SelfPlayTrainer:
                     torch.save(self.model.state_dict(), checkpoint_path)
                     print(f"\nCheckpoint saved: {checkpoint_path}\n")
             else:
-                # Engine policy path: GPU-assisted selection
-                seed = int(absolute_episode * 1000)
-                enc2, offs, scores = self._engine_policy_generate_once(seed)
-                # Update buffer and stats
-                if scores.shape[0] > 0:
-                    self.add_encoded_to_buffer(enc2, offs, scores)
-                    for final_score in scores.tolist():
-                        total_score += float(final_score)
-                        if final_score > 0:
-                            total_royalties += 1
-                            royalty_scores.append(float(final_score))
-                        elif final_score < 0:
-                            total_fouls += 1
+                # Engine policy path: GPU-assisted selection with parallel engines
+                num_workers = min(self.engine_workers,  max(1, self.num_workers))
+                request_q: Queue = Queue(maxsize=8192)
+                out_q: Queue = Queue(maxsize=num_workers)
+                resp_queues = {wid: Queue(maxsize=1024) for wid in range(num_workers)}
+                workers: List[Process] = []
+                for wid in range(num_workers):
+                    p = Process(target=SelfPlayTrainer._engine_worker_loop,
+                                args=(wid, absolute_episode * 1000 + wid,
+                                      int(self.engine_num_envs // max(1, num_workers)),
+                                      int(self.engine_max_candidates),
+                                      int(self.engine_cycles),
+                                      request_q, resp_queues[wid], out_q))
+                    p.daemon = True
+                    workers.append(p)
+                for p in workers:
+                    p.start()
+
+                finished = 0
+                # Serve requests until all workers finish
+                # Put model into eval() for inference-only serving
+                prev_training = self.model.training
+                self.model.eval()
+                while finished < num_workers:
+                    # Drain any completed outputs
+                    try:
+                        wid, enc2, offs, scores = out_q.get_nowait()
+                        enc2 = np.asarray(enc2, dtype=np.float32)
+                        offs = np.asarray(offs, dtype=np.int32)
+                        scores = np.asarray(scores, dtype=np.float32)
+                        if scores.shape[0] > 0:
+                            self.add_encoded_to_buffer(enc2, offs, scores)
+                            for final_score in scores.tolist():
+                                total_score += float(final_score)
+                                if final_score > 0:
+                                    total_royalties += 1
+                                    royalty_scores.append(float(final_score))
+                                elif final_score < 0:
+                                    total_fouls += 1
+                                else:
+                                    total_zero += 1
+                            # Update progress
+                            episodes_generated = int(scores.shape[0])
+                            for _ in range(episodes_generated):
+                                episode_idx += 1
+                                absolute_episode = start_episode + episode_idx - 1
+                                since_last_update += 1
+                                if since_last_update >= pbar_update_stride:
+                                    pbar.update(since_last_update)
+                                    since_last_update = 0
+                        finished += 1
+                    except Exception:
+                        pass
+
+                    # Batch serve candidate requests
+                    batch = []
+                    try:
+                        item = request_q.get(timeout=0.02)
+                        batch.append(item)
+                    except Exception:
+                        pass
+                    try:
+                        while len(batch) < self.engine_batch_agg:
+                            item = request_q.get_nowait()
+                            batch.append(item)
+                    except Exception:
+                        pass
+                    if batch:
+                        # Concatenate candidates
+                        enc_list = []
+                        meta_list = []
+                        owners = []
+                        for wid, enc, meta in batch:
+                            enc_list.append(torch.from_numpy(np.asarray(enc, dtype=np.float32)))
+                            meta_list.append(np.asarray(meta, dtype=np.int32))
+                            owners.append(wid)
+                        X = torch.cat([t for t in enc_list], dim=0).to(self.device, non_blocking=True)
+                        if self.device.type == "cuda" and _USE_AMP:
+                            try:
+                                from torch import amp as _amp
+                                with _amp.autocast('cuda', dtype=torch.float16):  # type: ignore[attr-defined]
+                                    V = self.model(X).squeeze()
+                            except Exception:
+                                from torch.cuda.amp import autocast as _autocast
+                                with _autocast(dtype=torch.float16):
+                                    V = self.model(X).squeeze()
                         else:
-                            total_zero += 1
-                episodes_generated = int(scores.shape[0])
-                # Update progress and training using episodes_generated
-                for _ in range(episodes_generated):
-                    episode_idx += 1
-                    absolute_episode = start_episode + episode_idx - 1
-                    since_last_update += 1
-                    if since_last_update >= pbar_update_stride:
-                        pbar.update(since_last_update)
-                        since_last_update = 0
-                    if len(self.replay_buffer) >= self.batch_size and episode_idx % episodes_per_train_step == 0:
-                        for _ in range(updates_per_cycle):
-                            loss = self.train_step()
-                            losses.append(loss)
-                        avg_loss = np.mean(losses[-100:]) if losses else 0.0
-                        royalty_rate = (total_royalties / (absolute_episode + 1)) * 100 if absolute_episode > 0 else 0
-                        pbar.set_postfix({
-                            'loss': f'{avg_loss:.4f}',
-                            'buffer': len(self.replay_buffer),
-                            'random%': f'{random_prob*100:.1f}%',
-                            'royalties': f'{total_royalties} ({royalty_rate:.2f}%)'
-                        })
-                    if absolute_episode > 0 and absolute_episode % eval_frequency == 0:
-                        pbar.clear()
-                        print(f"\n--- Evaluation at episode {absolute_episode:,} ---\n")
-                        training_foul_rate = (total_fouls / (absolute_episode + 1)) * 100 if absolute_episode > 0 else 0
-                        avg_score_per_hand = total_score / (absolute_episode + 1) if absolute_episode > 0 else 0.0
-                        self._evaluate(total_episodes=absolute_episode+1, total_fouls=total_fouls, 
-                                      total_royalties=total_royalties, total_zero=total_zero,
-                                      training_foul_rate=training_foul_rate,
-                                      avg_score_per_hand=avg_score_per_hand)
-                        checkpoint_path = f'value_net_checkpoint_ep{absolute_episode}.pth'
-                        torch.save(self.model.state_dict(), checkpoint_path)
-                        print(f"\nCheckpoint saved: {checkpoint_path}\n")
+                            V = self.model(X).squeeze()
+                        Vcpu = V.detach().float().cpu().numpy()
+                        # Split back per worker and choose best per env
+                        offset = 0
+                        for idx, (wid, meta_np) in enumerate(zip(owners, meta_list)):
+                            n = meta_np.shape[0]
+                            vals = Vcpu[offset:offset+n]
+                            offset += n
+                            best_by_env = {}
+                            for i in range(n):
+                                env_id = int(meta_np[i,0]); action_id = int(meta_np[i,1])
+                                v = float(vals[i])
+                                if (env_id not in best_by_env) or (v > best_by_env[env_id][0]):
+                                    best_by_env[env_id] = (v, action_id)
+                            chosen = np.array([[e, a] for e, (_, a) in best_by_env.items()], dtype=np.int32)
+                            resp_queues[wid].put(chosen if chosen.shape[0] > 0 else np.empty((0,2), dtype=np.int32))
+
+                # Cleanup workers
+                for p in workers:
+                    p.join(timeout=0.1)
+                    if p.is_alive():
+                        p.terminate()
+                # Restore model mode
+                if prev_training:
+                    self.model.train()
         
         pbar.close()
         # Flush any remaining progress not reflected due to batching
