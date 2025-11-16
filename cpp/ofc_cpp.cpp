@@ -24,6 +24,11 @@ py::tuple step_state_round0(py::array_t<int16_t> board,
                             py::array_t<int16_t> current5,
                             py::array_t<int16_t> deck,
                             py::array_t<int16_t> slots5);
+// Forward decl: encoding
+py::array_t<float> encode_state_batch_ints(py::array_t<int16_t> boards,  // (N,13) -1 or 0..51
+                                           py::array_t<int8_t> rounds,   // (N,)
+                                           py::array_t<int16_t> draws,   // (N,3) -1 or 0..51
+                                           py::array_t<int16_t> deck_sizes); // (N,)
 
 PYBIND11_MODULE(ofc_cpp, m) {
   m.doc() = "C++ accelerated OFC helpers";
@@ -46,6 +51,9 @@ PYBIND11_MODULE(ofc_cpp, m) {
   m.def("step_state_round0", &step_state_round0,
         py::arg("board"), py::arg("current5"), py::arg("deck"), py::arg("slots5"),
         "Apply round-0 placement and deal next draw; returns (board, new_round, new_draw, new_deck, done).");
+  m.def("encode_state_batch_ints", &encode_state_batch_ints,
+        py::arg("boards"), py::arg("rounds"), py::arg("draws"), py::arg("deck_sizes"),
+        "Encode states (ints) to feature matrix (N,838) float32.");
 }
 
 
