@@ -21,6 +21,13 @@ from multiprocessing import Pool, Process, Queue
 # Try optional C++ backend
 _USE_CPP = os.getenv("OFC_USE_CPP", "1") == "1"
 _USE_ENGINE_POLICY = os.getenv("OFC_USE_ENGINE_POLICY", "0") == "1"
+# Runtime tunables for throughput/control
+_ENGINE_START_PROGRESS = float(os.getenv("OFC_ENGINE_START_PROGRESS", "0.5") or "0.5")  # use policy after 50% by default
+_ENGINE_NUM_ENVS = int(os.getenv("OFC_ENGINE_NUM_ENVS", "0") or "0")
+_ENGINE_MAX_CANDIDATES = int(os.getenv("OFC_ENGINE_MAX_CANDIDATES", "0") or "0")
+_ENGINE_CYCLES = int(os.getenv("OFC_ENGINE_CYCLES", "0") or "0")
+_TRAIN_EPISODES_PER_STEP = int(os.getenv("OFC_TRAIN_EPISODES_PER_STEP", "0") or "0")
+_TRAIN_UPDATES_PER_CYCLE = int(os.getenv("OFC_TRAIN_UPDATES_PER_CYCLE", "0") or "0")
 try:
     import ofc_cpp as _CPP
 except Exception:
@@ -264,9 +271,10 @@ class SelfPlayTrainer:
         # Engine-policy settings (Phase 2)
         self.use_engine_policy = _USE_ENGINE_POLICY and (_CPP is not None)
         # Configure default engine parameters
-        self.engine_num_envs = max(32, min(256, self.num_workers))  # spawn many envs
-        self.engine_max_candidates = 128
-        self.engine_cycles = 200  # request/apply cycles per run
+        default_envs = max(32, min(256, self.num_workers))
+        self.engine_num_envs = _ENGINE_NUM_ENVS if _ENGINE_NUM_ENVS > 0 else default_envs
+        self.engine_max_candidates = _ENGINE_MAX_CANDIDATES if _ENGINE_MAX_CANDIDATES > 0 else 128
+        self.engine_cycles = _ENGINE_CYCLES if _ENGINE_CYCLES > 0 else 200  # request/apply cycles per run
         # Target normalization (EMA)
         self.score_mean_ema = 0.0
         self.score_var_ema = 1.0
@@ -674,9 +682,9 @@ class SelfPlayTrainer:
         
         # Generate episodes in batches sized to reduce blocking pauses
         episodes_per_batch = max(self.num_workers, 32)  # Smaller batches for smoother progress
-        # Train more frequently with more updates
-        episodes_per_train_step = 10_000
-        updates_per_cycle = 1024
+        # Train cadence (env-overridable)
+        episodes_per_train_step = _TRAIN_EPISODES_PER_STEP if _TRAIN_EPISODES_PER_STEP > 0 else 10_000
+        updates_per_cycle = _TRAIN_UPDATES_PER_CYCLE if _TRAIN_UPDATES_PER_CYCLE > 0 else 1024
         
         episode_idx = 0
         # Reduce UI overhead: batch progress bar updates
@@ -693,11 +701,15 @@ class SelfPlayTrainer:
             
             # Always random to maximize throughput
             if self.use_engine_policy:
-                # Anneal random probability linearly from 1.0 -> 0.0 over the run
+                # Anneal random probability linearly from 1.0 -> 0.0 over the run,
+                # but don't enable policy until ENGINE_START_PROGRESS threshold
                 progress = (absolute_episode - start_episode) / max(1, num_episodes)
-                random_prob = max(0.0, min(1.0, 1.0 - progress))
-                # Sample batch decision
-                use_random_for_batch = (np.random.rand() < random_prob)
+                if progress < _ENGINE_START_PROGRESS:
+                    use_random_for_batch = True
+                    random_prob = 1.0
+                else:
+                    random_prob = max(0.0, min(1.0, 1.0 - progress))
+                    use_random_for_batch = (np.random.rand() < random_prob)
             else:
                 # Engine policy disabled: keep 100% random
                 use_random_for_batch = True
