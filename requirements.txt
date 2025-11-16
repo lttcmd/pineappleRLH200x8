@@ -1,0 +1,13 @@
+# Core ML/DL libraries
+torch>=2.0.0
+numpy>=1.24.0
+
+# Progress bars and utilities
+tqdm>=4.65.0
+
+# Optional: For visualization/plotting
+matplotlib>=3.7.0
+
+# Optional: For tensorboard logging
+tensorboard>=2.13.0
+
