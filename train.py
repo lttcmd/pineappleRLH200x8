@@ -561,16 +561,20 @@ class SelfPlayTrainer:
         # Forward pass
         self.optimizer.zero_grad()
         predictions = self.model(state_batch)
-        # Weighted MSE: emphasize avoiding fouls (negative targets) and rewarding high scores
+        # Normalize targets per-batch, then apply weights to emphasize learning signals
         with torch.no_grad():
+            t_mean = targets.mean()
+            t_std = targets.std(unbiased=False).clamp_min(1e-3)
+            t_norm = (targets - t_mean) / t_std
             neg_mask = (targets < 0).float()
             high_mask = (targets > 5.0).float()
             weights = 1.0 + 0.5 * neg_mask + 0.25 * high_mask
-        mse_per = (predictions - targets) ** 2
+        mse_per = (predictions - t_norm) ** 2
         loss = (mse_per * weights).mean()
         
         # Backward pass
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
         
         return loss.item()
@@ -661,9 +665,9 @@ class SelfPlayTrainer:
         
         # Generate episodes in batches sized to reduce blocking pauses
         episodes_per_batch = max(self.num_workers, 32)  # Smaller batches for smoother progress
-        # Run long generation bursts, then do a large training burst
-        episodes_per_train_step = 100_000  # Generate 100k hands, then train
-        updates_per_cycle = 128  # Number of gradient updates after each 100k hands
+        # Train more frequently and longer to help early learning
+        episodes_per_train_step = 50_000   # Generate 50k hands, then train
+        updates_per_cycle = 2048           # Larger number of gradient updates
         
         episode_idx = 0
         # Reduce UI overhead: batch progress bar updates
