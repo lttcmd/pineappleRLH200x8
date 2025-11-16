@@ -497,8 +497,14 @@ class SelfPlayTrainer:
                     x = torch.from_numpy(np.asarray(enc, dtype=np.float32))
                     x = x.to(self.device, non_blocking=True)
                     if self.device.type == "cuda" and _USE_AMP:
-                        from torch.cuda.amp import autocast
-                        with autocast(dtype=torch.float16):
+                        # Prefer torch.amp.autocast('cuda', ...) per deprecation notice; fallback for older torch
+                        try:
+                            from torch import amp as _amp
+                            ctx = _amp.autocast('cuda', dtype=torch.float16)  # type: ignore[attr-defined]
+                        except Exception:
+                            from torch.cuda.amp import autocast as _autocast  # legacy
+                            ctx = _autocast(dtype=torch.float16)
+                        with ctx:
                             vals = self.model(x).squeeze()  # [T]
                     else:
                         vals = self.model(x).squeeze()  # [T]
