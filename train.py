@@ -82,14 +82,15 @@ def _generate_episode_with_net_worker(args: Tuple[int, dict]) -> List[Tuple[Stat
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    # Create environment and model (CPU for worker-side inference)
+    # Create environment and model
     env = OfcEnv()
     state = env.reset()
 
     input_dim = get_input_dim()
     model = ValueNet(input_dim, hidden_dim=512)
     model.load_state_dict(model_state_dict)
-    device = torch.device("cpu")
+    # Use GPU for value evaluation if available, else CPU
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     model.eval()
 
