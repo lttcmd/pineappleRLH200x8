@@ -264,11 +264,11 @@ class SelfPlayTrainer:
         self.use_engine_policy = _USE_ENGINE_POLICY and (_CPP is not None)
         # Configure default engine parameters
         self.engine_num_envs = max(64, min(256, self.num_workers))  # more envs
-        self.engine_max_candidates = 128  # explore more actions
-        self.engine_cycles = 300  # push episodes further per run
+        self.engine_max_candidates = 192  # stronger exploration
+        self.engine_cycles = 400  # push episodes further per run
         # Hybrid exploration schedule
-        self.random_phase_episodes = 2_000_000        # 100% random for first 2M hands
-        self.anneal_phase_episodes = 3_000_000        # linearly anneal over next 3M
+        self.random_phase_episodes = 200_000          # 100% random for first 200k hands
+        self.anneal_phase_episodes = 800_000          # linearly anneal next 800k
         self.min_random_prob = 0.15                   # keep at least 15% random thereafter
     
     def generate_episode(self, use_random: bool = True, env_idx: int = 0) -> List[Tuple[State, float]]:
@@ -885,7 +885,7 @@ class SelfPlayTrainer:
         complete_boards = 0
         
         with torch.no_grad():
-            for _ in range(50):  # More episodes for better stats
+            for _ in range(5000):  # Larger eval for stable metrics
                 episode_data = self.generate_episode(use_random=False)
                 if episode_data:
                     final_score = episode_data[-1][1]
@@ -927,7 +927,7 @@ class SelfPlayTrainer:
                 print()
             
             print(f"{'='*23}")
-            print(f"Evaluation Statistics: (50 test hands)")
+            print(f"Evaluation Statistics: (5000 test hands)")
             print(f"  Avg score: {avg_score:.2f} ± {std_score:.2f}")
             print(f"  Range: [{min_score:.1f}, {max_score:.1f}]")
             print(f"  Foul rate: {foul_rate:.1f}%")
