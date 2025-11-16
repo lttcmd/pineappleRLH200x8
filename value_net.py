@@ -27,15 +27,19 @@ class ValueNet(nn.Module):
         )
         self.value_head = nn.Linear(trunk_dim, 1)
         self.foul_head = nn.Linear(trunk_dim, 1)
+        # Round-0 policy over 12 fixed candidate placements (logits)
+        self.round0_head = nn.Linear(trunk_dim, 12)
     
     def forward(self, x: torch.Tensor):
         """
         Returns:
             value: (B,1)
             foul_logit: (B,1)
+            round0_logits: (B,12)
         """
         h = self.trunk(x)
         value = self.value_head(h)
         foul_logit = self.foul_head(h)
-        return value, foul_logit
+        round0_logits = self.round0_head(h)
+        return value, foul_logit, round0_logits
 
