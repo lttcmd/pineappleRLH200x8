@@ -202,8 +202,8 @@ static py::tuple request_policy_batch(uint64_t handle, int max_candidates_per_en
   ssize_t T = rounds_all.size();
   if (T==0) {
     // return empty
-    auto enc = py::array_t<float>({0, (ssize_t)838});
-    auto meta_np = py::array_t<int32_t>({0, (ssize_t)3});
+    auto enc = py::array_t<float>(py::array::ShapeContainer{(ssize_t)0, (ssize_t)838});
+    auto meta_np = py::array_t<int32_t>(py::array::ShapeContainer{(ssize_t)0, (ssize_t)3});
     return py::make_tuple(enc, meta_np);
   }
   py::array_t<int16_t> boards_np({T, (ssize_t)13});
