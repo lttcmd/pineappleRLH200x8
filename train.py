@@ -20,6 +20,10 @@ from multiprocessing import Pool, Process, Queue
 # Try optional C++ backend
 _USE_CPP = os.getenv("OFC_USE_CPP", "1") == "1"
 _USE_ENGINE_POLICY = os.getenv("OFC_USE_ENGINE_POLICY", "0") == "1"
+_USE_AMP = os.getenv("OFC_USE_AMP", "1") == "1"
+_ENGINE_NUM_ENVS = int(os.getenv("OFC_ENGINE_NUM_ENVS", "0") or "0")
+_ENGINE_MAX_CAND = int(os.getenv("OFC_ENGINE_MAX_CANDIDATES", "0") or "0")
+_ENGINE_CYCLES = int(os.getenv("OFC_ENGINE_CYCLES", "0") or "0")
 try:
     import ofc_cpp as _CPP
 except Exception:
@@ -263,9 +267,10 @@ class SelfPlayTrainer:
         # Engine-policy settings (Phase 2)
         self.use_engine_policy = _USE_ENGINE_POLICY and (_CPP is not None)
         # Configure default engine parameters
-        self.engine_num_envs = max(32, min(256, self.num_workers))  # spawn many envs
-        self.engine_max_candidates = 64
-        self.engine_cycles = 200  # request/apply cycles per run
+        default_envs = max(32, min(256, self.num_workers))
+        self.engine_num_envs = _ENGINE_NUM_ENVS if _ENGINE_NUM_ENVS > 0 else default_envs
+        self.engine_max_candidates = _ENGINE_MAX_CAND if _ENGINE_MAX_CAND > 0 else 64
+        self.engine_cycles = _ENGINE_CYCLES if _ENGINE_CYCLES > 0 else 200  # request/apply cycles per run
     
     def generate_episode(self, use_random: bool = True, env_idx: int = 0) -> List[Tuple[State, float]]:
         """
@@ -491,7 +496,12 @@ class SelfPlayTrainer:
                 with torch.no_grad():
                     x = torch.from_numpy(np.asarray(enc, dtype=np.float32))
                     x = x.to(self.device, non_blocking=True)
-                    vals = self.model(x).squeeze()  # [T]
+                    if self.device.type == "cuda" and _USE_AMP:
+                        from torch.cuda.amp import autocast
+                        with autocast(dtype=torch.float16):
+                            vals = self.model(x).squeeze()  # [T]
+                    else:
+                        vals = self.model(x).squeeze()  # [T]
                     vals_cpu = vals.detach().float().cpu().numpy()
                 # Pick best per env
                 best_by_env = {}
