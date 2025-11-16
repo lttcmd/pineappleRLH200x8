@@ -439,18 +439,12 @@ class SelfPlayTrainer:
             encoded_batch = encode_state_batch(next_states).to(self.device)
             
             # Forward pass on entire batch (much faster on GPU)
-            values, foul_logit, round0_logits = self.model(encoded_batch)
+            values, foul_logit, _ = self.model(encoded_batch)
             values = values.squeeze()
             foul_prob = torch.sigmoid(foul_logit).squeeze()
-            if hasattr(state, 'round') and state.round == 0:
-                # Use round-0 policy head (12 candidates) if available
-                # encoded_batch shape should be (12, 838) for round-0
-                logits = round0_logits.squeeze()
-                best_idx = logits.argmax().item()
-            else:
-                # Foul-aware value selection
-                combined = values - 5.0 * foul_prob
-                best_idx = combined.argmax().item()
+            # Foul-aware value selection
+            combined = values - 5.0 * foul_prob
+            best_idx = combined.argmax().item()
             best_action = valid_actions[best_idx]
         
         self.model.train()
@@ -503,14 +497,10 @@ class SelfPlayTrainer:
                 with torch.no_grad():
                     x = torch.from_numpy(np.asarray(enc, dtype=np.float32))
                     x = x.to(self.device, non_blocking=True)
-                    vals, foul_logit, round0_logits = self.model(x)
+                    vals, foul_logit, _ = self.model(x)
                     vals = vals.squeeze()
                     foul_prob = torch.sigmoid(foul_logit).squeeze()
-                    # Heuristic: first engine cycle tends to be round-0; prefer round0 head if shape matches
-                    if round0_logits.shape[-1] == 12:
-                        combined = round0_logits.squeeze()
-                    else:
-                        combined = vals - 5.0 * foul_prob
+                    combined = vals - 5.0 * foul_prob
                     vals_cpu = combined.detach().float().cpu().numpy()
                 # Pick best per env
                 best_by_env = {}
