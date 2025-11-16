@@ -26,6 +26,7 @@ _ENGINE_MAX_CAND = int(os.getenv("OFC_ENGINE_MAX_CANDIDATES", "0") or "0")
 _ENGINE_CYCLES = int(os.getenv("OFC_ENGINE_CYCLES", "0") or "0")
 _ENGINE_WORKERS = int(os.getenv("OFC_ENGINE_WORKERS", "0") or "0")
 _RUN_V2 = os.getenv("OFC_RUN_V2", "0") == "1"
+_V2_RANDOM_BATCH = int(os.getenv("OFC_V2_RANDOM_BATCH", "2048") or "2048")
 try:
     import ofc_cpp as _CPP
 except Exception:
@@ -711,7 +712,7 @@ class SelfPlayTrainer:
         )
         
         # Generate episodes in batches sized to reduce blocking pauses
-        episodes_per_batch = max(self.num_workers, 32)  # Smaller batches for smoother progress
+        episodes_per_batch = max(self.num_workers, 32)  # base
         # Run long generation bursts, then do a large training burst
         episodes_per_train_step = 100_000  # Generate 100k hands, then train
         updates_per_cycle = 128  # Number of gradient updates after each 100k hands
@@ -724,6 +725,13 @@ class SelfPlayTrainer:
         while start_episode + episode_idx < num_episodes:
             # Calculate how many episodes to generate in this batch
             remaining = num_episodes - (start_episode + episode_idx)
+            # If V2 and we're in random phase, use much larger random batch to maximize throughput
+            if _RUN_V2:
+                # progress computed below; use last progress cached or compute simply here
+                prog_tmp = (start_episode + episode_idx - start_episode) / max(1, num_episodes)
+                # Heuristic: if still mostly random (>0.5), use large random batch target
+                if prog_tmp < 0.5:
+                    episodes_per_batch = max(episodes_per_batch, _V2_RANDOM_BATCH)
             batch_size_current = min(episodes_per_batch, remaining)
             
             # Calculate absolute episode number
