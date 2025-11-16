@@ -491,7 +491,12 @@ class SelfPlayTrainer:
     def load_checkpoint(self, checkpoint_path: str) -> int:
         """Load model from checkpoint. Returns episode number."""
         print(f"Loading checkpoint: {checkpoint_path}")
-        self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
+        # Load weights-only to avoid pickle execution and silence FutureWarning
+        try:
+            self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device, weights_only=True))
+        except TypeError:
+            # Fallback for older torch versions without weights_only
+            self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
         # Extract episode number from filename
         match = re.search(r'ep(\d+)\.pth', checkpoint_path)
         episode = int(match.group(1)) if match else 0
