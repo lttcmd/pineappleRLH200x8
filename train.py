@@ -547,7 +547,7 @@ class SelfPlayTrainer:
         # Generate episodes in larger batches using multiprocessing for speed
         # Aggressively scale batch size with number of workers to push CPU harder
         episodes_per_batch = max(self.num_workers * 8, 64)  # Generate many episodes at once
-        episodes_per_train_step = 8  # Train every N episodes
+        episodes_per_train_step = 32  # Train less frequently to keep episode throughput high
         
         episode_idx = 0
         while start_episode + episode_idx < num_episodes:
@@ -611,8 +611,8 @@ class SelfPlayTrainer:
                 
                 # Train less frequently but do more gradient steps per cycle
                 if len(self.replay_buffer) >= self.batch_size and episode_idx % episodes_per_train_step == 0:
-                    # Do more gradient updates per training cycle to better utilize GPU
-                    for _ in range(16):
+                    # Keep a modest number of gradient updates to avoid stalling generation
+                    for _ in range(4):
                         loss = self.train_step()
                         losses.append(loss)
                     
@@ -754,7 +754,7 @@ def main():
         #buffer_size=200000,  # Back to original size
         #batch_size=64,  # Back to original size
         buffer_size=200000,
-        batch_size=256,
+        batch_size=64,
         learning_rate=1e-3,
         use_cuda=True  # Will use CUDA if available
     )
