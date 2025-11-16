@@ -9,6 +9,7 @@ import random
 from collections import deque
 from typing import List, Tuple, Optional
 import numpy as np
+import itertools
 from tqdm import tqdm
 import time
 import os
@@ -217,7 +218,7 @@ class SelfPlayTrainer:
         model: ValueNet,
         buffer_size: int = 10000,
         batch_size: int = 64,
-        learning_rate: float = 1e-3,
+        learning_rate: float = 3e-4,
         use_cuda: bool = True,
         num_workers: int = None
     ):
@@ -237,7 +238,7 @@ class SelfPlayTrainer:
         self.batch_size = batch_size
         self.replay_buffer = deque(maxlen=buffer_size)
         
-        self.optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+        self.optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
         self.criterion = nn.MSELoss()
         
         # Use multiple environments for parallel episode generation
@@ -264,8 +265,12 @@ class SelfPlayTrainer:
         self.use_engine_policy = _USE_ENGINE_POLICY and (_CPP is not None)
         # Configure default engine parameters
         self.engine_num_envs = max(32, min(256, self.num_workers))  # spawn many envs
-        self.engine_max_candidates = 64
+        self.engine_max_candidates = 128
         self.engine_cycles = 200  # request/apply cycles per run
+        # Target normalization (EMA)
+        self.score_mean_ema = 0.0
+        self.score_var_ema = 1.0
+        self.score_ema_decay = 0.99
     
     def generate_episode(self, use_random: bool = True, env_idx: int = 0) -> List[Tuple[State, float]]:
         """
@@ -488,7 +493,7 @@ class SelfPlayTrainer:
                 if enc.shape[0] == 0:
                     break
                 # Forward on GPU
-                with torch.no_grad():
+        with torch.no_grad():
                     x = torch.from_numpy(np.asarray(enc, dtype=np.float32))
                     x = x.to(self.device, non_blocking=True)
                     vals = self.model(x).squeeze()  # [T]
@@ -523,8 +528,16 @@ class SelfPlayTrainer:
         if len(self.replay_buffer) < self.batch_size:
             return 0.0
         
-        # Sample batch
-        batch = random.sample(self.replay_buffer, self.batch_size)
+        # Sample batch with freshness bias: half from most recent 10% of buffer
+        n = len(self.replay_buffer)
+        recent_span = max(self.batch_size, int(0.1 * n))
+        recent_start = max(0, n - recent_span)
+        # Convert deque slice to list
+        recent_pool = list(itertools.islice(self.replay_buffer, recent_start, n))
+        half = self.batch_size // 2
+        batch_recent = [recent_pool[random.randrange(len(recent_pool))] for _ in range(half)] if recent_pool else []
+        batch_random = random.sample(self.replay_buffer, self.batch_size - len(batch_recent))
+        batch = batch_recent + batch_random
         
         # Extract states and scores
         states = [s for s, _ in batch]
@@ -545,6 +558,16 @@ class SelfPlayTrainer:
                 # Fallback: try through encoder (handles lists)
                 state_batch = encode_state_batch(states)
         targets = torch.tensor(scores, dtype=torch.float32).unsqueeze(1)
+        # Clip and normalize targets using EMA stats
+        targets = torch.clamp(targets, -20.0, 20.0)
+        with torch.no_grad():
+            batch_mean = targets.mean().item()
+            batch_var = targets.var(unbiased=False).item() + 1e-6
+            self.score_mean_ema = self.score_ema_decay * self.score_mean_ema + (1 - self.score_ema_decay) * batch_mean
+            self.score_var_ema = self.score_ema_decay * self.score_var_ema + (1 - self.score_ema_decay) * batch_var
+            norm_mean = self.score_mean_ema
+            norm_std = float(self.score_var_ema) ** 0.5
+        targets = (targets - norm_mean) / max(norm_std, 1e-3)
         
         # Move to device with pinned memory for faster transfer
         if self.pin_memory:
@@ -651,9 +674,9 @@ class SelfPlayTrainer:
         
         # Generate episodes in batches sized to reduce blocking pauses
         episodes_per_batch = max(self.num_workers, 32)  # Smaller batches for smoother progress
-        # Run long generation bursts, then do a large training burst
-        episodes_per_train_step = 100_000  # Generate 100k hands, then train
-        updates_per_cycle = 128  # Number of gradient updates after each 100k hands
+        # Train more frequently with more updates
+        episodes_per_train_step = 10_000
+        updates_per_cycle = 1024
         
         episode_idx = 0
         # Reduce UI overhead: batch progress bar updates
@@ -866,7 +889,7 @@ class SelfPlayTrainer:
         complete_boards = 0
         
         with torch.no_grad():
-            for _ in range(50):  # More episodes for better stats
+            for _ in range(1000):  # Evaluate on 1000 hands for stability
                 episode_data = self.generate_episode(use_random=False)
                 if episode_data:
                     final_score = episode_data[-1][1]
@@ -908,7 +931,7 @@ class SelfPlayTrainer:
                 print()
             
             print(f"{'='*23}")
-            print(f"Evaluation Statistics: (50 test hands)")
+            print(f"Evaluation Statistics: (1000 test hands)")
             print(f"  Avg score: {avg_score:.2f} ± {std_score:.2f}")
             print(f"  Range: [{min_score:.1f}, {max_score:.1f}]")
             print(f"  Foul rate: {foul_rate:.1f}%")
@@ -951,8 +974,8 @@ def main():
     )
     
     try:
-        # Fresh 1,000,000-hand run; anneal random->policy; checkpoint every 50k
-        num_episodes = 1_000_000
+        # Fresh 10,000,000-hand run; anneal random->policy; checkpoint every 50k
+        num_episodes = 10_000_000
         
         trainer.train(
             num_episodes=num_episodes,
