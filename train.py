@@ -546,7 +546,7 @@ class SelfPlayTrainer:
         
         # Generate episodes in larger batches using multiprocessing for speed
         # Aggressively scale batch size with number of workers to push CPU harder
-        episodes_per_batch = max(self.num_workers * 4, 32)  # Generate many episodes at once
+        episodes_per_batch = max(self.num_workers * 8, 64)  # Generate many episodes at once
         episodes_per_train_step = 8  # Train every N episodes
         
         episode_idx = 0
@@ -558,9 +558,9 @@ class SelfPlayTrainer:
             # Calculate absolute episode number
             absolute_episode = start_episode + episode_idx
             
-            # Gradually transition from random to learned policy
-            random_prob = max(0.0, 1.0 - (absolute_episode / (num_episodes * 0.8)))
-            use_random_for_batch = random_prob > 0.5  # Use multiprocessing for random episodes
+            # Throughput-first mode: always generate random episodes in parallel for max hands/sec
+            random_prob = 1.0
+            use_random_for_batch = True  # Keep CPU pool saturated for highest throughput
             
             # Generate batch of episodes
             if use_random_for_batch:
@@ -582,12 +582,8 @@ class SelfPlayTrainer:
                 if current_ep:  # Add remaining
                     episodes_list.append(current_ep)
             else:
-                # Parallel net-based episodes via centralized GPU action server
-                episodes_parallel = self.generate_episodes_parallel_with_server(
-                    num_episodes=batch_size_current,
-                    base_seed=absolute_episode * 2000
-                )
-                episodes_list = [ep for ep in episodes_parallel if ep]
+                # Unused in throughput-first mode
+                episodes_list = []
             
             # Process each episode
             for episode_data in episodes_list:
