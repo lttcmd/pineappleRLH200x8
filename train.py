@@ -20,13 +20,6 @@ from multiprocessing import Pool, Process, Queue
 # Try optional C++ backend
 _USE_CPP = os.getenv("OFC_USE_CPP", "1") == "1"
 _USE_ENGINE_POLICY = os.getenv("OFC_USE_ENGINE_POLICY", "0") == "1"
-_USE_AMP = os.getenv("OFC_USE_AMP", "1") == "1"
-_ENGINE_NUM_ENVS = int(os.getenv("OFC_ENGINE_NUM_ENVS", "0") or "0")
-_ENGINE_MAX_CAND = int(os.getenv("OFC_ENGINE_MAX_CANDIDATES", "0") or "0")
-_ENGINE_CYCLES = int(os.getenv("OFC_ENGINE_CYCLES", "0") or "0")
-_ENGINE_WORKERS = int(os.getenv("OFC_ENGINE_WORKERS", "0") or "0")
-_RUN_V2 = os.getenv("OFC_RUN_V2", "0") == "1"
-_V2_RANDOM_BATCH = int(os.getenv("OFC_V2_RANDOM_BATCH", "2048") or "2048")
 try:
     import ofc_cpp as _CPP
 except Exception:
@@ -234,14 +227,6 @@ class SelfPlayTrainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() and use_cuda else "cpu")
         self.model = self.model.to(self.device)
         self.model.train()
-        # Enable TF32 where available (H100/H200): improves GEMM throughput
-        try:
-            if self.device.type == "cuda":
-                import torch.backends.cuda as _bkc, torch.backends.cudnn as _bkcu
-                _bkc.matmul.allow_tf32 = True
-                _bkcu.allow_tf32 = True
-        except Exception:
-            pass
         
         print(f"Using device: {self.device}")
         if self.device.type == "cuda":
@@ -278,39 +263,9 @@ class SelfPlayTrainer:
         # Engine-policy settings (Phase 2)
         self.use_engine_policy = _USE_ENGINE_POLICY and (_CPP is not None)
         # Configure default engine parameters
-        default_envs = max(32, min(256, self.num_workers))
-        self.engine_num_envs = _ENGINE_NUM_ENVS if _ENGINE_NUM_ENVS > 0 else default_envs
-        self.engine_max_candidates = _ENGINE_MAX_CAND if _ENGINE_MAX_CAND > 0 else 64
-        self.engine_cycles = _ENGINE_CYCLES if _ENGINE_CYCLES > 0 else 200  # request/apply cycles per run
-        # Parallel engines
-        default_workers = max(1, min(8, self.num_workers))  # cap to avoid IPC thrash
-        self.engine_workers = (_ENGINE_WORKERS if _ENGINE_WORKERS > 0 else default_workers) if self.use_engine_policy else 0
-        # Aggregation batch size for GPU forwards
-        self.engine_batch_agg = int(os.getenv("OFC_ENGINE_BATCH_AGG", "16384"))
-
-    # -------- Parallel Engine Workers --------
-    @staticmethod
-    def _engine_worker_loop(worker_id: int, seed: int, num_envs: int, max_cand: int, cycles: int,
-                            request_q: Queue, response_q: Queue, out_q: Queue):
-        import numpy as _np
-        import ofc_cpp as _cpp
-        h = _cpp.create_engine(_np.uint64(seed))
-        try:
-            _cpp.engine_start_envs(h, int(num_envs))
-            for _ in range(int(cycles)):
-                enc, meta = _cpp.request_policy_batch(h, int(max_cand))
-                if enc.shape[0] == 0:
-                    break
-                request_q.put((worker_id, enc, meta))
-                # Wait for chosen actions for this worker
-                chosen = response_q.get()
-                if chosen is None or len(chosen) == 0:
-                    break
-                _cpp.apply_policy_actions(h, chosen)
-            enc2, offs, scores = _cpp.engine_collect_encoded_episodes(h)
-            out_q.put((worker_id, enc2, offs, scores))
-        finally:
-            _cpp.destroy_engine(h)
+        self.engine_num_envs = max(32, min(256, self.num_workers))  # spawn many envs
+        self.engine_max_candidates = 64
+        self.engine_cycles = 200  # request/apply cycles per run
     
     def generate_episode(self, use_random: bool = True, env_idx: int = 0) -> List[Tuple[State, float]]:
         """
@@ -536,18 +491,7 @@ class SelfPlayTrainer:
                 with torch.no_grad():
                     x = torch.from_numpy(np.asarray(enc, dtype=np.float32))
                     x = x.to(self.device, non_blocking=True)
-                    if self.device.type == "cuda" and _USE_AMP:
-                        # Prefer torch.amp.autocast('cuda', ...) per deprecation notice; fallback for older torch
-                        try:
-                            from torch import amp as _amp
-                            ctx = _amp.autocast('cuda', dtype=torch.float16)  # type: ignore[attr-defined]
-                        except Exception:
-                            from torch.cuda.amp import autocast as _autocast  # legacy
-                            ctx = _autocast(dtype=torch.float16)
-                        with ctx:
-                            vals = self.model(x).squeeze()  # [T]
-                    else:
-                        vals = self.model(x).squeeze()  # [T]
+                    vals = self.model(x).squeeze()  # [T]
                     vals_cpu = vals.detach().float().cpu().numpy()
                 # Pick best per env
                 best_by_env = {}
@@ -665,12 +609,6 @@ class SelfPlayTrainer:
             episodes_per_update: How many episodes to collect before updating
             eval_frequency: How often to evaluate (in episodes)
         """
-        # Configure checkpoint prefix (v1 default, v2 new run)
-        checkpoint_prefix = 'value_net_checkpoint_ep'
-        if _RUN_V2:
-            resume = False
-            checkpoint_prefix = 'value_net_v2_ep'
-
         print(f"\n{'='*60}")
         print(f"Starting RL Training")
         print(f"{'='*60}")
@@ -712,7 +650,7 @@ class SelfPlayTrainer:
         )
         
         # Generate episodes in batches sized to reduce blocking pauses
-        episodes_per_batch = max(self.num_workers, 32)  # base
+        episodes_per_batch = max(self.num_workers, 32)  # Smaller batches for smoother progress
         # Run long generation bursts, then do a large training burst
         episodes_per_train_step = 100_000  # Generate 100k hands, then train
         updates_per_cycle = 128  # Number of gradient updates after each 100k hands
@@ -725,34 +663,22 @@ class SelfPlayTrainer:
         while start_episode + episode_idx < num_episodes:
             # Calculate how many episodes to generate in this batch
             remaining = num_episodes - (start_episode + episode_idx)
-            # If V2 and we're in random phase, use much larger random batch to maximize throughput
-            if _RUN_V2:
-                # progress computed below; use last progress cached or compute simply here
-                prog_tmp = (start_episode + episode_idx - start_episode) / max(1, num_episodes)
-                # Heuristic: if still mostly random (>0.5), use large random batch target
-                if prog_tmp < 0.5:
-                    episodes_per_batch = max(episodes_per_batch, _V2_RANDOM_BATCH)
             batch_size_current = min(episodes_per_batch, remaining)
             
             # Calculate absolute episode number
             absolute_episode = start_episode + episode_idx
             
-            # Random/policy scheduling
-            if _RUN_V2:
+            # Always random to maximize throughput
+            if self.use_engine_policy:
+                # Anneal random probability linearly from 1.0 -> 0.0 over the run
                 progress = (absolute_episode - start_episode) / max(1, num_episodes)
-                random_prob = max(0.0, 1.0 - progress)  # 1.0 -> 0.0 over run
-                # Deterministic bias: keep batches fully random early for throughput,
-                # switch to policy late; only mix probabilistically near the midpoint
-                if random_prob > 0.5:
-                    use_random_for_batch = True
-                elif random_prob == 0.0:
-                    use_random_for_batch = False
-                else:
-                    use_random_for_batch = (np.random.rand() < random_prob)
+                random_prob = max(0.0, min(1.0, 1.0 - progress))
+                # Sample batch decision
+                use_random_for_batch = (np.random.rand() < random_prob)
             else:
-                # Legacy behavior
-                use_random_for_batch = not self.use_engine_policy
-                random_prob = 0.0 if self.use_engine_policy else 1.0
+                # Engine policy disabled: keep 100% random
+                use_random_for_batch = True
+                random_prob = 1.0
             
             # Generate batch of episodes
             if use_random_for_batch:
@@ -850,136 +776,58 @@ class SelfPlayTrainer:
                                   total_royalties=total_royalties, total_zero=total_zero,
                                   training_foul_rate=training_foul_rate,
                                   avg_score_per_hand=avg_score_per_hand)
-                    checkpoint_path = f'{checkpoint_prefix}{absolute_episode}.pth'
+                    checkpoint_path = f'value_net_checkpoint_ep{absolute_episode}.pth'
                     torch.save(self.model.state_dict(), checkpoint_path)
                     print(f"\nCheckpoint saved: {checkpoint_path}\n")
             else:
-                # Engine policy path: GPU-assisted selection with parallel engines
-                num_workers = min(self.engine_workers,  max(1, self.num_workers))
-                request_q: Queue = Queue(maxsize=8192)
-                out_q: Queue = Queue(maxsize=num_workers)
-                resp_queues = {wid: Queue(maxsize=1024) for wid in range(num_workers)}
-                workers: List[Process] = []
-                for wid in range(num_workers):
-                    p = Process(target=SelfPlayTrainer._engine_worker_loop,
-                                args=(wid, absolute_episode * 1000 + wid,
-                                      int(self.engine_num_envs // max(1, num_workers)),
-                                      int(self.engine_max_candidates),
-                                      int(self.engine_cycles),
-                                      request_q, resp_queues[wid], out_q))
-                    p.daemon = True
-                    workers.append(p)
-                for p in workers:
-                    p.start()
-
-                finished = 0
-                # Serve requests until all workers finish
-                # Put model into eval() for inference-only serving
-                prev_training = self.model.training
-                self.model.eval()
-                while finished < num_workers:
-                    # Drain any completed outputs
-                    try:
-                        wid, enc2, offs, scores = out_q.get_nowait()
-                        enc2 = np.asarray(enc2, dtype=np.float32)
-                        offs = np.asarray(offs, dtype=np.int32)
-                        scores = np.asarray(scores, dtype=np.float32)
-                        if scores.shape[0] > 0:
-                            self.add_encoded_to_buffer(enc2, offs, scores)
-                            for final_score in scores.tolist():
-                                total_score += float(final_score)
-                                if final_score > 0:
-                                    total_royalties += 1
-                                    royalty_scores.append(float(final_score))
-                                elif final_score < 0:
-                                    total_fouls += 1
-                                else:
-                                    total_zero += 1
-                            # Update progress
-                            episodes_generated = int(scores.shape[0])
-                            for _ in range(episodes_generated):
-                                episode_idx += 1
-                                absolute_episode = start_episode + episode_idx - 1
-                                since_last_update += 1
-                                if since_last_update >= pbar_update_stride:
-                                    pbar.update(since_last_update)
-                                    since_last_update = 0
-                        finished += 1
-                    except Exception:
-                        pass
-
-                    # Batch serve candidate requests
-                    batch = []
-                    try:
-                        item = request_q.get(timeout=0.02)
-                        batch.append(item)
-                    except Exception:
-                        pass
-                    try:
-                        while len(batch) < self.engine_batch_agg:
-                            item = request_q.get_nowait()
-                            batch.append(item)
-                    except Exception:
-                        pass
-                    if batch:
-                        # Concatenate candidates
-                        enc_list = []
-                        meta_list = []
-                        owners = []
-                        for wid, enc, meta in batch:
-                            enc_list.append(torch.from_numpy(np.asarray(enc, dtype=np.float32)))
-                            meta_list.append(np.asarray(meta, dtype=np.int32))
-                            owners.append(wid)
-                        X = torch.cat([t for t in enc_list], dim=0).to(self.device, non_blocking=True)
-                        if self.device.type == "cuda" and _USE_AMP:
-                            try:
-                                from torch import amp as _amp
-                                with _amp.autocast('cuda', dtype=torch.float16):  # type: ignore[attr-defined]
-                                    V = self.model(X).squeeze()
-                            except Exception:
-                                from torch.cuda.amp import autocast as _autocast
-                                with _autocast(dtype=torch.float16):
-                                    V = self.model(X).squeeze()
+                # Engine policy path: GPU-assisted selection
+                seed = int(absolute_episode * 1000)
+                enc2, offs, scores = self._engine_policy_generate_once(seed)
+                # Update buffer and stats
+                if scores.shape[0] > 0:
+                    self.add_encoded_to_buffer(enc2, offs, scores)
+                    for final_score in scores.tolist():
+                        total_score += float(final_score)
+                        if final_score > 0:
+                            total_royalties += 1
+                            royalty_scores.append(float(final_score))
+                        elif final_score < 0:
+                            total_fouls += 1
                         else:
-                            V = self.model(X).squeeze()
-                        Vcpu = V.detach().float().cpu().numpy()
-                        # Split back per worker and choose best per env
-                        offset = 0
-                        for idx, (wid, meta_np) in enumerate(zip(owners, meta_list)):
-                            n = meta_np.shape[0]
-                            vals = Vcpu[offset:offset+n]
-                            offset += n
-                            best_by_env = {}
-                            for i in range(n):
-                                env_id = int(meta_np[i,0]); action_id = int(meta_np[i,1])
-                                v = float(vals[i])
-                                if (env_id not in best_by_env) or (v > best_by_env[env_id][0]):
-                                    best_by_env[env_id] = (v, action_id)
-                            chosen = np.array([[e, a] for e, (_, a) in best_by_env.items()], dtype=np.int32)
-                            resp_queues[wid].put(chosen if chosen.shape[0] > 0 else np.empty((0,2), dtype=np.int32))
-
-                # Cleanup workers
-                for p in workers:
-                    p.join(timeout=0.1)
-                    if p.is_alive():
-                        p.terminate()
-                # Restore model mode
-                if prev_training:
-                    self.model.train()
-
-                # After serving policy batches, periodic evaluation/checkpoint
-                if absolute_episode > 0 and absolute_episode % eval_frequency == 0:
-                    pbar.clear()
-                    print(f"\n--- Evaluation at episode {absolute_episode:,} ---\n")
-                    training_foul_rate = (total_fouls / (absolute_episode + 1)) * 100 if absolute_episode > 0 else 0
-                    avg_score_per_hand = total_score / (absolute_episode + 1) if absolute_episode > 0 else 0.0
-                    self._evaluate(total_episodes=absolute_episode+1, total_fouls=total_fouls, 
-                                  total_royalties=total_royalties, total_zero=total_zero,
-                                  training_foul_rate=training_foul_rate,
-                                  avg_score_per_hand=avg_score_per_hand)
-                    checkpoint_path = f'{checkpoint_prefix}{absolute_episode}.pth'
-                    torch.save(self.model.state_dict(), checkpoint_path)
-                    print(f"\nCheckpoint saved: {checkpoint_path}\n")
+                            total_zero += 1
+                episodes_generated = int(scores.shape[0])
+                # Update progress and training using episodes_generated
+                for _ in range(episodes_generated):
+                    episode_idx += 1
+                    absolute_episode = start_episode + episode_idx - 1
+                    since_last_update += 1
+                    if since_last_update >= pbar_update_stride:
+                        pbar.update(since_last_update)
+                        since_last_update = 0
+                    if len(self.replay_buffer) >= self.batch_size and episode_idx % episodes_per_train_step == 0:
+                        for _ in range(updates_per_cycle):
+                            loss = self.train_step()
+                            losses.append(loss)
+                        avg_loss = np.mean(losses[-100:]) if losses else 0.0
+                        royalty_rate = (total_royalties / (absolute_episode + 1)) * 100 if absolute_episode > 0 else 0
+                        pbar.set_postfix({
+                            'loss': f'{avg_loss:.4f}',
+                            'buffer': len(self.replay_buffer),
+                            'random%': f'{random_prob*100:.1f}%',
+                            'royalties': f'{total_royalties} ({royalty_rate:.2f}%)'
+                        })
+                    if absolute_episode > 0 and absolute_episode % eval_frequency == 0:
+                        pbar.clear()
+                        print(f"\n--- Evaluation at episode {absolute_episode:,} ---\n")
+                        training_foul_rate = (total_fouls / (absolute_episode + 1)) * 100 if absolute_episode > 0 else 0
+                        avg_score_per_hand = total_score / (absolute_episode + 1) if absolute_episode > 0 else 0.0
+                        self._evaluate(total_episodes=absolute_episode+1, total_fouls=total_fouls, 
+                                      total_royalties=total_royalties, total_zero=total_zero,
+                                      training_foul_rate=training_foul_rate,
+                                      avg_score_per_hand=avg_score_per_hand)
+                        checkpoint_path = f'value_net_checkpoint_ep{absolute_episode}.pth'
+                        torch.save(self.model.state_dict(), checkpoint_path)
+                        print(f"\nCheckpoint saved: {checkpoint_path}\n")
         
         pbar.close()
         # Flush any remaining progress not reflected due to batching
@@ -1089,12 +937,7 @@ def main():
     """
     # Initialize model with larger network for better GPU utilization
     input_dim = get_input_dim()
-    hidden_env = os.getenv("OFC_MODEL_HIDDEN", "").strip()
-    try:
-        hidden_dim = int(hidden_env) if hidden_env else 512
-    except Exception:
-        hidden_dim = 512
-    model = ValueNet(input_dim, hidden_dim=hidden_dim)  # configurable size for GPU saturation
+    model = ValueNet(input_dim, hidden_dim=512)  # Increased from 256 to 512
     
     # Initialize trainer (will auto-detect CUDA)
     trainer = SelfPlayTrainer(
@@ -1108,24 +951,15 @@ def main():
     )
     
     try:
-        # Configure run
-        if os.getenv("OFC_RUN_V2", "0") == "1":
-            # Fresh run, 2.5M hands, checkpoint every 50k, no resume
-            num_episodes = 2_500_000
-            trainer.train(
-                num_episodes=num_episodes,
-                episodes_per_update=10,
-                eval_frequency=50_000,
-                resume=False
-            )
-        else:
-            # Legacy long run
-            num_episodes = 500_000_000
-            trainer.train(
-                num_episodes=num_episodes,
-                episodes_per_update=10,
-                eval_frequency=10000
-            )
+        # Fresh 1,000,000-hand run; anneal random->policy; checkpoint every 50k
+        num_episodes = 1_000_000
+        
+        trainer.train(
+            num_episodes=num_episodes,
+            episodes_per_update=10,
+            eval_frequency=50_000,  # Evaluate and checkpoint every 50k hands
+            resume=False
+        )
         
         # Save final model
         torch.save(model.state_dict(), 'value_net.pth')
