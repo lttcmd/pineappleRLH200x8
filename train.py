@@ -844,7 +844,7 @@ def main():
     try:
         # Train for millions of hands
         # Resume from latest checkpoint and target 5 million total hands
-        num_episodes = 5_000_000
+        num_episodes = 500_000_000
         
         trainer.train(
             num_episodes=num_episodes,
