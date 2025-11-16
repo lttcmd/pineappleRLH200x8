@@ -4,6 +4,7 @@ set(SRC
   ofc_step.cpp
   ofc_actions.cpp
   ofc_encode.cpp
+  ofc_engine.cpp
 )
 
 pybind11_add_module(ofc_cpp ${SRC})

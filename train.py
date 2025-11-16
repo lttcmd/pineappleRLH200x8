@@ -17,6 +17,14 @@ import re
 import multiprocessing as mp
 from multiprocessing import Pool, Process, Queue
 
+# Try optional C++ backend
+_USE_CPP = os.getenv("OFC_USE_CPP", "1") == "1"
+try:
+    import ofc_cpp as _CPP
+except Exception:
+    _CPP = None
+    _USE_CPP = False
+
 from ofc_env import OfcEnv, State, Action
 from state_encoding import encode_state, encode_state_batch, get_input_dim
 from value_net import ValueNet
@@ -431,6 +439,27 @@ class SelfPlayTrainer:
         """Add episode data to replay buffer."""
         for state, score in episode_data:
             self.replay_buffer.append((state, score))
+
+    def add_encoded_to_buffer(self, encoded_states: np.ndarray, episode_offsets: np.ndarray, final_scores: np.ndarray):
+        """
+        Add pre-encoded states to replay buffer. Each state's target is the episode's final score.
+        encoded_states: float32 [S, 838]
+        episode_offsets: int32 [E+1]
+        final_scores: float32 [E]
+        """
+        # Minimal validation
+        if encoded_states.ndim != 2 or encoded_states.shape[1] != 838:
+            raise ValueError("encoded_states must be [S,838]")
+        if episode_offsets.ndim != 1 or final_scores.ndim != 1 or episode_offsets.shape[0] != final_scores.shape[0] + 1:
+            raise ValueError("episode_offsets must be [E+1] and final_scores [E] with matching sizes")
+        # Append each state's encoded vector with its episode score
+        for e in range(final_scores.shape[0]):
+            s0 = int(episode_offsets[e])
+            s1 = int(episode_offsets[e+1])
+            score = float(final_scores[e])
+            # Slice view; store per-state rows
+            for s in range(s0, s1):
+                self.replay_buffer.append((encoded_states[s], score))
     
     def train_step(self) -> float:
         """
@@ -449,8 +478,20 @@ class SelfPlayTrainer:
         states = [s for s, _ in batch]
         scores = [score for _, score in batch]
         
-        # Encode states in batch (much faster than one-by-one)
-        state_batch = encode_state_batch(states)
+        # Encode states in batch (supports both State objects and pre-encoded vectors)
+        # Detect if items are pre-encoded numpy arrays/tensors of shape [838]
+        if hasattr(states[0], "board"):
+            # Likely a State
+            state_batch = encode_state_batch(states)
+        else:
+            # Assume iterable of numpy arrays or tensors with shape [838]
+            if isinstance(states[0], np.ndarray):
+                state_batch = torch.from_numpy(np.stack(states, axis=0).astype(np.float32, copy=False))
+            elif torch.is_tensor(states[0]):
+                state_batch = torch.stack(states, dim=0).to(dtype=torch.float32)
+            else:
+                # Fallback: try through encoder (handles lists)
+                state_batch = encode_state_batch(states)
         targets = torch.tensor(scores, dtype=torch.float32).unsqueeze(1)
         
         # Move to device with pinned memory for faster transfer
@@ -581,62 +622,81 @@ class SelfPlayTrainer:
             
             # Generate batch of episodes
             if use_random_for_batch:
-                # Parallel generation for random episodes
-                all_episode_data = self.generate_episodes_parallel(
-                    batch_size_current,
-                    use_random=True,
-                    base_seed=absolute_episode * 1000
-                )
+                episodes_generated = 0
+                if _USE_CPP and _CPP is not None:
+                    # Single C++ call generates many random episodes efficiently
+                    seed = int(absolute_episode * 1000)
+                    encoded, offsets, scores_np = _CPP.generate_random_episodes(np.uint64(seed), int(batch_size_current))
+                    # Numpy arrays
+                    encoded_np = np.array(encoded, copy=False)            # [S,838] float32
+                    offsets_np = np.array(offsets, copy=False).astype(np.int32, copy=False)  # [E+1]
+                    scores_np = np.array(scores_np, copy=False).astype(np.float32, copy=False)  # [E]
+                    # Update statistics and buffer
+                    self.add_encoded_to_buffer(encoded_np, offsets_np, scores_np)
+                    episodes_generated = scores_np.shape[0]
+                    # Track stats
+                    final_scores_batch = scores_np.tolist()
+                    for final_score in final_scores_batch:
+                        total_score += float(final_score)
+                        if final_score > 0:
+                            total_royalties += 1
+                            royalty_scores.append(float(final_score))
+                        elif final_score < 0:
+                            total_fouls += 1
+                        else:
+                            total_zero += 1
+                else:
+                    # Fallback: Python multiprocessing generator
+                    all_episode_data = self.generate_episodes_parallel(
+                        batch_size_current,
+                        use_random=True,
+                        base_seed=absolute_episode * 1000
+                    )
 
-                # Split into individual episodes (each episode ~13 states)
-                episodes_list = []
-                current_ep = []
-                for state, score in all_episode_data:
-                    current_ep.append((state, score))
-                    if len(current_ep) >= 13:  # OFC typically has ~13 placements
+                    # Split into individual episodes (each episode ~13 states)
+                    episodes_list = []
+                    current_ep = []
+                    for state, score in all_episode_data:
+                        current_ep.append((state, score))
+                        if len(current_ep) >= 13:  # OFC typically has ~13 placements
+                            episodes_list.append(current_ep)
+                            current_ep = []
+                    if current_ep:  # Add remaining
                         episodes_list.append(current_ep)
-                        current_ep = []
-                if current_ep:  # Add remaining
-                    episodes_list.append(current_ep)
+
+                    # Process each episode (Python path)
+                    for episode_data in episodes_list:
+                        if not episode_data:
+                            continue
+                        final_score = episode_data[-1][1]
+                        total_score += final_score
+                        if final_score > 0:
+                            total_royalties += 1
+                            royalty_scores.append(final_score)
+                        elif final_score < 0:
+                            total_fouls += 1
+                        else:
+                            total_zero += 1
+                        self.add_to_buffer(episode_data)
+                        episodes_generated += 1
             else:
                 # Unused in 100% random mode
-                episodes_list = []
+                episodes_generated = 0
             
             
-            # Process each episode
-            for episode_data in episodes_list:
-                if not episode_data:
-                    continue
-                
-                # Track statistics
-                final_score = episode_data[-1][1]
-                total_score += final_score
-                if final_score > 0:
-                    total_royalties += 1
-                    royalty_scores.append(final_score)
-                elif final_score < 0:
-                    total_fouls += 1
-                else:
-                    total_zero += 1
-                
-                # Add to buffer
-                self.add_to_buffer(episode_data)
-                
-                # Update progress
+            # Update progress and training using episodes_generated
+            for _ in range(episodes_generated):
                 episode_idx += 1
                 absolute_episode = start_episode + episode_idx - 1
                 since_last_update += 1
                 if since_last_update >= pbar_update_stride:
                     pbar.update(since_last_update)
                     since_last_update = 0
-                
                 # Train in bursts after large generation windows
                 if len(self.replay_buffer) >= self.batch_size and episode_idx % episodes_per_train_step == 0:
-                    # Larger training burst to utilize GPU, amortized over 100k hands
                     for _ in range(updates_per_cycle):
                         loss = self.train_step()
                         losses.append(loss)
-                    
                     # Update progress bar
                     avg_loss = np.mean(losses[-100:]) if losses else 0.0
                     royalty_rate = (total_royalties / (absolute_episode + 1)) * 100 if absolute_episode > 0 else 0
@@ -646,21 +706,16 @@ class SelfPlayTrainer:
                         'random%': f'{random_prob*100:.1f}%',
                         'royalties': f'{total_royalties} ({royalty_rate:.2f}%)'
                     })
-                
                 # Periodic evaluation and checkpointing
                 if absolute_episode > 0 and absolute_episode % eval_frequency == 0:
-                    # Clear progress bar and print clean evaluation
                     pbar.clear()
                     print(f"\n--- Evaluation at episode {absolute_episode:,} ---\n")
-                    # Pass training stats to evaluation
                     training_foul_rate = (total_fouls / (absolute_episode + 1)) * 100 if absolute_episode > 0 else 0
                     avg_score_per_hand = total_score / (absolute_episode + 1) if absolute_episode > 0 else 0.0
                     self._evaluate(total_episodes=absolute_episode+1, total_fouls=total_fouls, 
                                   total_royalties=total_royalties, total_zero=total_zero,
                                   training_foul_rate=training_foul_rate,
                                   avg_score_per_hand=avg_score_per_hand)
-                    
-                    # Save checkpoint
                     checkpoint_path = f'value_net_checkpoint_ep{absolute_episode}.pth'
                     torch.save(self.model.state_dict(), checkpoint_path)
                     print(f"\nCheckpoint saved: {checkpoint_path}\n")

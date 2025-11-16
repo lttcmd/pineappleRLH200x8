@@ -29,6 +29,8 @@ py::array_t<float> encode_state_batch_ints(py::array_t<int16_t> boards,  // (N,1
                                            py::array_t<int8_t> rounds,   // (N,)
                                            py::array_t<int16_t> draws,   // (N,3) -1 or 0..51
                                            py::array_t<int16_t> deck_sizes); // (N,)
+// Episode generator
+py::tuple generate_random_episodes(uint64_t seed, int num_episodes);
 
 PYBIND11_MODULE(ofc_cpp, m) {
   m.doc() = "C++ accelerated OFC helpers";
@@ -54,6 +56,9 @@ PYBIND11_MODULE(ofc_cpp, m) {
   m.def("encode_state_batch_ints", &encode_state_batch_ints,
         py::arg("boards"), py::arg("rounds"), py::arg("draws"), py::arg("deck_sizes"),
         "Encode states (ints) to feature matrix (N,838) float32.");
+  m.def("generate_random_episodes", &generate_random_episodes,
+        py::arg("seed"), py::arg("num_episodes"),
+        "Generate random episodes end-to-end and return (encoded_states [S,838], episode_offsets [E+1], final_scores [E]).");
 }
 
 
