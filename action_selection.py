@@ -52,7 +52,8 @@ def choose_best_action_with_value_net(
         # Find best action
         if values.dim() == 0:  # Single action
             best_idx = 0
-        else:\n            best_idx = values.argmax().item()
+        else:
+            best_idx = values.argmax().item()
         
         return legal_actions[best_idx]
 
@@ -114,7 +115,7 @@ def load_trained_model(model_path: str = 'value_net.pth', device: torch.device =
         device = get_device()
     
     input_dim = get_input_dim()
-    model = ValueNet(input_dim, hidden_dim=256)
+    model = ValueNet(input_dim, hidden_dim=512)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model = model.to(device)
     model.eval()
