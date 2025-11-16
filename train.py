@@ -24,6 +24,7 @@ _USE_AMP = os.getenv("OFC_USE_AMP", "1") == "1"
 _ENGINE_NUM_ENVS = int(os.getenv("OFC_ENGINE_NUM_ENVS", "0") or "0")
 _ENGINE_MAX_CAND = int(os.getenv("OFC_ENGINE_MAX_CANDIDATES", "0") or "0")
 _ENGINE_CYCLES = int(os.getenv("OFC_ENGINE_CYCLES", "0") or "0")
+_ENGINE_WORKERS = int(os.getenv("OFC_ENGINE_WORKERS", "0") or "0")
 try:
     import ofc_cpp as _CPP
 except Exception:
@@ -280,7 +281,8 @@ class SelfPlayTrainer:
         self.engine_max_candidates = _ENGINE_MAX_CAND if _ENGINE_MAX_CAND > 0 else 64
         self.engine_cycles = _ENGINE_CYCLES if _ENGINE_CYCLES > 0 else 200  # request/apply cycles per run
         # Parallel engines
-        self.engine_workers = max(1, self.num_workers) if self.use_engine_policy else 0
+        default_workers = max(1, min(8, self.num_workers))  # cap to avoid IPC thrash
+        self.engine_workers = (_ENGINE_WORKERS if _ENGINE_WORKERS > 0 else default_workers) if self.use_engine_policy else 0
         # Aggregation batch size for GPU forwards
         self.engine_batch_agg = int(os.getenv("OFC_ENGINE_BATCH_AGG", "16384"))
 
@@ -1045,7 +1047,12 @@ def main():
     """
     # Initialize model with larger network for better GPU utilization
     input_dim = get_input_dim()
-    model = ValueNet(input_dim, hidden_dim=512)  # Increased from 256 to 512
+    hidden_env = os.getenv("OFC_MODEL_HIDDEN", "").strip()
+    try:
+        hidden_dim = int(hidden_env) if hidden_env else 512
+    except Exception:
+        hidden_dim = 512
+    model = ValueNet(input_dim, hidden_dim=hidden_dim)  # configurable size for GPU saturation
     
     # Initialize trainer (will auto-detect CUDA)
     trainer = SelfPlayTrainer(
