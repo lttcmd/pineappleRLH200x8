@@ -8,6 +8,7 @@ namespace py = pybind11;
 // Caps (keep in sync with Python)
 static constexpr int MAX_EMPTY_SLOTS_CONSIDERED = 8;
 static constexpr int MAX_SLOT_COMBOS_PER_PAIR = 6;
+static constexpr int MAX_INITIAL_PERMUTATIONS = 12;
 
 // Return keeps (M,2) int8 and placements (M,2,2) int16
 // Inputs:
@@ -98,6 +99,40 @@ py::tuple legal_actions_rounds1to4(py::array_t<int16_t> board, int round_idx) {
   }
 
   return py::make_tuple(keeps, places);
+}
+
+// Round 0 actions: return (placements(n,5,2)) where each row is (card_idx, slot_idx)
+py::array_t<int16_t> legal_actions_round0(py::array_t<int16_t> board) {
+  auto b = board.unchecked<1>();
+  if (b.shape(0) != 13) throw std::runtime_error("board must have 13 entries");
+  // Collect empty slots
+  std::vector<int16_t> empty;
+  empty.reserve(13);
+  for (int i=0;i<13;++i) if (b(i) == -1) empty.push_back(static_cast<int16_t>(i));
+  if (empty.size() < 5) {
+    return py::array_t<int16_t>(py::array::ShapeContainer{0,5,2});
+  }
+  if (empty.size() > MAX_EMPTY_SLOTS_CONSIDERED) {
+    empty.resize(MAX_EMPTY_SLOTS_CONSIDERED);
+  }
+  // Generate first MAX_INITIAL_PERMUTATIONS permutations of [0..4]
+  int total = MAX_INITIAL_PERMUTATIONS;
+  auto placements = py::array_t<int16_t>(py::array::ShapeContainer{total, 5, 2});
+  auto P = placements.mutable_unchecked<3>();
+  // We map perm[i] -> empty[i]
+  // Use a simple fixed set of 12 permutations
+  static const int perms[12][5] = {
+    {0,1,2,3,4},{0,1,2,4,3},{0,1,3,2,4},{0,1,3,4,2},
+    {0,2,1,3,4},{0,2,1,4,3},{0,2,3,1,4},{0,2,3,4,1},
+    {1,0,2,3,4},{1,0,2,4,3},{1,0,3,2,4},{1,0,3,4,2}
+  };
+  for (int k=0;k<total;++k) {
+    for (int i=0;i<5;++i) {
+      P(k,i,0) = static_cast<int16_t>(perms[k][i]);     // card_idx 0..4
+      P(k,i,1) = empty[i];                              // slot_idx chosen i
+    }
+  }
+  return placements;
 }
 
 

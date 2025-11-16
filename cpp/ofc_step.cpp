@@ -42,14 +42,8 @@ py::tuple step_state(py::array_t<int16_t> board,
   int new_round = round_idx;
 
   if (round_idx == 0) {
-    // Place all 5 initial cards according to placements indices 0..4
-    // In Python Action uses permutations(range(5)) mapped by placements list
-    // Here we assume keep_i/keep_j ignored for round 0; placements slots use keep idx 0..4
-    // To keep parity with Python, placements should carry card_idx 0..4.
-    // We place any indices present in place0_keep_idx/place1_keep_idx and expect caller to provide remaining via repeated calls? 
-    // For compatibility, we require caller to pass a full mapping via board already set before? Given complexity, we mimic Python two placements only for rounds>0.
-    // For round 0, we won't handle here; caller should keep Python path. Return input unchanged.
-    // Signal done false.
+    // Round 0 handling is provided by a dedicated API due to 5-card placement
+    // The caller should use step_state_round0; here, fall back to no-op
     auto out_b = py::array_t<int16_t>({13});
     auto out_b_m = out_b.mutable_unchecked<1>();
     for (int i=0;i<13;++i) out_b_m(i) = b[i];
@@ -112,6 +106,53 @@ py::tuple step_state(py::array_t<int16_t> board,
 
     return py::make_tuple(out_b, new_round, out_draw, out_deck, done);
   }
+}
+
+// Round 0 specialized step: place 5 cards and deal next draw
+py::tuple step_state_round0(py::array_t<int16_t> board,
+                            py::array_t<int16_t> current5,
+                            py::array_t<int16_t> deck,
+                            py::array_t<int16_t> slots5) {
+  auto b_in = board.unchecked<1>();
+  auto d_in = deck.unchecked<1>();
+  auto c5 = current5.unchecked<1>();
+  auto sl = slots5.unchecked<1>(); // shape (5,)
+
+  std::array<int16_t,13> b{};
+  for (int i=0;i<13;++i) b[i] = b_in(i);
+  std::vector<int16_t> d(d_in.shape(0));
+  for (ssize_t i=0;i<d_in.shape(0);++i) d[i] = d_in(i);
+
+  // Place all 5: card index i goes to slots5[i]
+  for (int i=0;i<5;++i) {
+    int slot = sl(i);
+    if (slot>=0 && slot<13 && b[slot] == -1) {
+      b[slot] = c5(i);
+    }
+  }
+  // Deal next 3 for round 1
+  std::array<int16_t,3> next_draw{ -1, -1, -1 };
+  if ((int)d.size() >= 3) {
+    for (int k=0;k<3;++k) {
+      next_draw[k] = d.back();
+      d.pop_back();
+    }
+  }
+  int new_round = 1;
+  bool all_filled = true;
+  for (int i=0;i<13;++i) if (b[i] == -1) { all_filled = false; break; }
+  bool done = (new_round > 4) || all_filled;
+
+  auto out_b = py::array_t<int16_t>({13});
+  auto out_b_m = out_b.mutable_unchecked<1>();
+  for (int i=0;i<13;++i) out_b_m(i) = b[i];
+  auto out_draw = py::array_t<int16_t>({3});
+  auto out_draw_m = out_draw.mutable_unchecked<1>();
+  for (int i=0;i<3;++i) out_draw_m(i) = next_draw[i];
+  auto out_deck = py::array_t<int16_t>({(ssize_t)d.size()});
+  auto out_deck_m = out_deck.mutable_unchecked<1>();
+  for (ssize_t i=0;i<(ssize_t)d.size();++i) out_deck_m(i) = d[i];
+  return py::make_tuple(out_b, new_round, out_draw, out_deck, done);
 }
 
 

@@ -18,6 +18,12 @@ py::tuple step_state(py::array_t<int16_t> board,
                      int place1_keep_idx, int place1_slot);
 // Forward decl from ofc_actions.cpp
 py::tuple legal_actions_rounds1to4(py::array_t<int16_t> board, int round_idx);
+py::array_t<int16_t> legal_actions_round0(py::array_t<int16_t> board);
+// Forward decl from ofc_step.cpp round0
+py::tuple step_state_round0(py::array_t<int16_t> board,
+                            py::array_t<int16_t> current5,
+                            py::array_t<int16_t> deck,
+                            py::array_t<int16_t> slots5);
 
 PYBIND11_MODULE(ofc_cpp, m) {
   m.doc() = "C++ accelerated OFC helpers";
@@ -34,6 +40,12 @@ PYBIND11_MODULE(ofc_cpp, m) {
   m.def("legal_actions_rounds1to4", &legal_actions_rounds1to4,
         py::arg("board"), py::arg("round_idx"),
         "Generate legal actions for rounds 1..4 with caps; returns (keeps(n,2), placements(n,2,2)).");
+  m.def("legal_actions_round0", &legal_actions_round0,
+        py::arg("board"),
+        "Generate round-0 placements; returns placements(n,5,2) of (card_idx, slot_idx).");
+  m.def("step_state_round0", &step_state_round0,
+        py::arg("board"), py::arg("current5"), py::arg("deck"), py::arg("slots5"),
+        "Apply round-0 placement and deal next draw; returns (board, new_round, new_draw, new_deck, done).");
 }
 
 

@@ -122,23 +122,25 @@ class OfcEnv:
         legal = []
         
         if state.round == 0:
-            # Initial round: must place all 5 cards
-            # Find empty slots (optimized with list comp)
+            if _CPP is not None:
+                import numpy as _np
+                board_arr = _np.array([c.to_int() if c is not None else -1 for c in state.board], dtype=_np.int16)
+                placements = _CPP.legal_actions_round0(board_arr)
+                legal: List[Action] = []
+                for i in range(placements.shape[0]):
+                    placement5 = [(int(placements[i,j,0]), int(placements[i,j,1])) for j in range(5)]
+                    legal.append(Action(keep_indices=tuple(range(5)), placements=placement5))
+                return legal
+            # Fallback Python path
+            legal = []
             empty_slots = [i for i in range(13) if state.board[i] is None]
-            
             if len(empty_slots) < 5:
-                return []  # Invalid state
-            
-            # Optionally subsample empty slots to reduce branching
+                return []
             if len(empty_slots) > MAX_EMPTY_SLOTS_CONSIDERED:
-                # Randomly sample to add diversity
                 import random as _rand
                 empty_slots = _rand.sample(empty_slots, MAX_EMPTY_SLOTS_CONSIDERED)
-                # Ensure we still have at least 5
                 if len(empty_slots) < 5:
                     empty_slots = [i for i in range(13) if state.board[i] is None]
-            
-            # Reduced permutations - generate only a capped number (was 24)
             count = 0
             for perm in permutations(range(5)):
                 placements = [(card_idx, empty_slots[i]) for i, card_idx in enumerate(perm)]
@@ -200,21 +202,29 @@ class OfcEnv:
         Reward is 0 during play, final score computed at end.
         """
         # C++ accelerated path for rounds 1..4
-        if _CPP is not None and state.round > 0:
+        if _CPP is not None:
             import numpy as _np
             # Prepare arrays for C++
             board_arr = _np.array([c.to_int() if c is not None else -1 for c in state.board], dtype=_np.int16)
-            draw_arr = _np.full((3,), -1, dtype=_np.int16)
-            for i in range(min(3, len(state.current_draw))):
-                draw_arr[i] = state.current_draw[i].to_int()
             deck_arr = _np.array([c.to_int() for c in state.deck], dtype=_np.int16)
-            keep_i, keep_j = action.keep_indices
-            (b2, new_round, d2, deck2, done) = _CPP.step_state(
-                board_arr, int(state.round), draw_arr, deck_arr,
-                int(keep_i), int(keep_j),
-                int(action.placements[0][0]), int(action.placements[0][1]),
-                int(action.placements[1][0]), int(action.placements[1][1])
-            )
+            if state.round == 0:
+                # Round 0 specialized path
+                current5 = _np.array([c.to_int() for c in state.current_draw], dtype=_np.int16)
+                slots5 = _np.array([p[1] for p in action.placements], dtype=_np.int16)
+                (b2, new_round, d2, deck2, done) = _CPP.step_state_round0(
+                    board_arr, current5, deck_arr, slots5
+                )
+            else:
+                draw_arr = _np.full((3,), -1, dtype=_np.int16)
+                for i in range(min(3, len(state.current_draw))):
+                    draw_arr[i] = state.current_draw[i].to_int()
+                keep_i, keep_j = action.keep_indices
+                (b2, new_round, d2, deck2, done) = _CPP.step_state(
+                    board_arr, int(state.round), draw_arr, deck_arr,
+                    int(keep_i), int(keep_j),
+                    int(action.placements[0][0]), int(action.placements[0][1]),
+                    int(action.placements[1][0]), int(action.placements[1][1])
+                )
             # Convert back to Python State
             from ofc_types import Card, Rank, Suit
             def int_to_card(v: int):
