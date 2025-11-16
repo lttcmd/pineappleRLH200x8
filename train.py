@@ -547,7 +547,9 @@ class SelfPlayTrainer:
         # Generate episodes in larger batches using multiprocessing for speed
         # Aggressively scale batch size with number of workers to push CPU harder
         episodes_per_batch = max(self.num_workers * 8, 64)  # Generate many episodes at once
-        episodes_per_train_step = 32  # Train less frequently to keep episode throughput high
+        # Run long generation bursts, then do a large training burst
+        episodes_per_train_step = 100_000  # Generate 100k hands, then train
+        updates_per_cycle = 128  # Number of gradient updates after each 100k hands
         
         episode_idx = 0
         # Throughput-first: 100% random batches for maximum hands/sec
@@ -611,10 +613,10 @@ class SelfPlayTrainer:
                 absolute_episode = start_episode + episode_idx - 1
                 pbar.update(1)
                 
-                # Train less frequently but do more gradient steps per cycle
+                # Train in bursts after large generation windows
                 if len(self.replay_buffer) >= self.batch_size and episode_idx % episodes_per_train_step == 0:
-                    # Keep a modest number of gradient updates to avoid stalling generation
-                    for _ in range(4):
+                    # Larger training burst to utilize GPU, amortized over 100k hands
+                    for _ in range(updates_per_cycle):
                         loss = self.train_step()
                         losses.append(loss)
                     
