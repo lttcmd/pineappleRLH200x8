@@ -195,7 +195,9 @@ class ActionServer:
 
         mega = torch.cat(tensors, dim=0).to(self.device, non_blocking=True)
         with torch.no_grad():
-            values = self.model(mega).squeeze()
+            vals, foul_logit, _ = self.model(mega)
+            values = vals.squeeze()
+            foul_prob = torch.sigmoid(foul_logit).squeeze()
 
         # Respond
         offset = 0
@@ -565,7 +567,7 @@ class SelfPlayTrainer:
         
         # Forward pass (two-head model: value and foul)
         self.optimizer.zero_grad()
-        value_pred, foul_logit = self.model(state_batch)
+        value_pred, foul_logit, _ = self.model(state_batch)
         # Normalize regression targets and build foul labels
         with torch.no_grad():
             t_mean = targets.mean()
