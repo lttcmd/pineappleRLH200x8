@@ -269,7 +269,7 @@ class SelfPlayTrainer:
         # Hybrid exploration schedule
         self.random_phase_episodes = 200_000          # 100% random for first 200k hands
         self.anneal_phase_episodes = 800_000          # linearly anneal next 800k
-        self.min_random_prob = 0.15                   # keep at least 15% random thereafter
+        self.min_random_prob = 0.30                   # keep at least 30% random thereafter
     
     def generate_episode(self, use_random: bool = True, env_idx: int = 0) -> List[Tuple[State, float]]:
         """
@@ -444,7 +444,7 @@ class SelfPlayTrainer:
             foul_prob = torch.sigmoid(foul_logit).squeeze()
             
             # Find best action with foul-aware score
-            combined = values - 2.0 * foul_prob
+            combined = values - 5.0 * foul_prob
             best_idx = combined.argmax().item()
             best_action = valid_actions[best_idx]
         
@@ -501,7 +501,7 @@ class SelfPlayTrainer:
                     vals, foul_logit = self.model(x)
                     vals = vals.squeeze()
                     foul_prob = torch.sigmoid(foul_logit).squeeze()
-                    combined = vals - 2.0 * foul_prob
+                    combined = vals - 5.0 * foul_prob
                     vals_cpu = combined.detach().float().cpu().numpy()
                 # Pick best per env
                 best_by_env = {}
@@ -580,7 +580,7 @@ class SelfPlayTrainer:
         value_loss = (mse_per * weights).mean()
         bce = torch.nn.functional.binary_cross_entropy_with_logits(foul_logit, foul_labels, reduction='none')
         foul_loss = (bce * (1.0 + 1.0 * foul_labels)).mean()
-        loss = value_loss + 2.0 * foul_loss
+        loss = value_loss + 5.0 * foul_loss
         # Backward pass
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
