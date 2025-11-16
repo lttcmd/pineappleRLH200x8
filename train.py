@@ -144,7 +144,7 @@ class ActionServer:
     Central GPU action server that batches requests from workers and runs one large
     forward pass on the GPU, then replies with best indices.
     """
-    def __init__(self, model: ValueNet, device: torch.device, request_queue: Queue, response_queues, max_batch: int = 2048):
+    def __init__(self, model: ValueNet, device: torch.device, request_queue: Queue, response_queues, max_batch: int = 16384):
         self.model = model
         self.device = device
         self.request_queue = request_queue
@@ -156,7 +156,7 @@ class ActionServer:
     def stop(self):
         self._running = False
 
-    def serve_once(self, timeout: float = 0.02) -> int:
+    def serve_once(self, timeout: float = 0.10) -> int:
         """
         Collect up to max_batch requests and serve them in one GPU forward.
         Returns number of requests served.
@@ -340,7 +340,8 @@ class SelfPlayTrainer:
             self.request_queue = Queue(maxsize=8192)
         self.response_queues = {}
         
-        num_to_run = min(num_episodes, self.num_workers)
+        # Limit concurrent env workers to reduce IPC contention and improve batching
+        num_to_run = min(num_episodes, max(4, self.num_workers // 3))
         # Create per-worker response queues
         for wid in range(num_to_run):
             self.response_queues[wid] = Queue(maxsize=1024)
@@ -355,8 +356,8 @@ class SelfPlayTrainer:
             p.daemon = True
             workers.append(p)
         
-        # Start action server in main process
-        server = ActionServer(self.model, self.device, self.request_queue, self.response_queues, max_batch=4096)
+        # Start action server in main process with larger max batch
+        server = ActionServer(self.model, self.device, self.request_queue, self.response_queues, max_batch=16384)
         
         # Start workers
         for p in workers:
@@ -366,7 +367,7 @@ class SelfPlayTrainer:
         finished = 0
         episodes: List[List[Tuple[State, float]]] = []
         while finished < num_to_run:
-            served = server.serve_once(timeout=0.02)
+            served = server.serve_once(timeout=0.10)
             # Check for finished outputs
             try:
                 wid, data = out_q.get_nowait()
