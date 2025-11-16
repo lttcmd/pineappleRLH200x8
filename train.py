@@ -741,7 +741,14 @@ class SelfPlayTrainer:
             if _RUN_V2:
                 progress = (absolute_episode - start_episode) / max(1, num_episodes)
                 random_prob = max(0.0, 1.0 - progress)  # 1.0 -> 0.0 over run
-                use_random_for_batch = (np.random.rand() < random_prob)
+                # Deterministic bias: keep batches fully random early for throughput,
+                # switch to policy late; only mix probabilistically near the midpoint
+                if random_prob > 0.5:
+                    use_random_for_batch = True
+                elif random_prob == 0.0:
+                    use_random_for_batch = False
+                else:
+                    use_random_for_batch = (np.random.rand() < random_prob)
             else:
                 # Legacy behavior
                 use_random_for_batch = not self.use_engine_policy
