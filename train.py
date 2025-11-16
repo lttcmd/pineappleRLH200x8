@@ -439,10 +439,13 @@ class SelfPlayTrainer:
             encoded_batch = encode_state_batch(next_states).to(self.device)
             
             # Forward pass on entire batch (much faster on GPU)
-            values = self.model(encoded_batch).squeeze()
+            values, foul_logit = self.model(encoded_batch)
+            values = values.squeeze()
+            foul_prob = torch.sigmoid(foul_logit).squeeze()
             
-            # Find best action
-            best_idx = values.argmax().item()
+            # Find best action with foul-aware score
+            combined = values - 2.0 * foul_prob
+            best_idx = combined.argmax().item()
             best_action = valid_actions[best_idx]
         
         self.model.train()
@@ -495,8 +498,11 @@ class SelfPlayTrainer:
                 with torch.no_grad():
                     x = torch.from_numpy(np.asarray(enc, dtype=np.float32))
                     x = x.to(self.device, non_blocking=True)
-                    vals = self.model(x).squeeze()  # [T]
-                    vals_cpu = vals.detach().float().cpu().numpy()
+                    vals, foul_logit = self.model(x)
+                    vals = vals.squeeze()
+                    foul_prob = torch.sigmoid(foul_logit).squeeze()
+                    combined = vals - 2.0 * foul_prob
+                    vals_cpu = combined.detach().float().cpu().numpy()
                 # Pick best per env
                 best_by_env = {}
                 for i in range(meta.shape[0]):
@@ -558,20 +564,23 @@ class SelfPlayTrainer:
             state_batch = state_batch.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
         
-        # Forward pass
+        # Forward pass (two-head model: value and foul)
         self.optimizer.zero_grad()
-        predictions = self.model(state_batch)
-        # Normalize targets per-batch, then apply weights to emphasize learning signals
+        value_pred, foul_logit = self.model(state_batch)
+        # Normalize regression targets and build foul labels
         with torch.no_grad():
             t_mean = targets.mean()
             t_std = targets.std(unbiased=False).clamp_min(1e-3)
             t_norm = (targets - t_mean) / t_std
-            neg_mask = (targets < 0).float()
+            foul_labels = (targets < 0).float()
+            neg_mask = foul_labels
             high_mask = (targets > 5.0).float()
             weights = 1.0 + 0.5 * neg_mask + 0.25 * high_mask
-        mse_per = (predictions - t_norm) ** 2
-        loss = (mse_per * weights).mean()
-        
+        mse_per = (value_pred - t_norm) ** 2
+        value_loss = (mse_per * weights).mean()
+        bce = torch.nn.functional.binary_cross_entropy_with_logits(foul_logit, foul_labels, reduction='none')
+        foul_loss = (bce * (1.0 + 1.0 * foul_labels)).mean()
+        loss = value_loss + 2.0 * foul_loss
         # Backward pass
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
