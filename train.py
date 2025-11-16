@@ -611,8 +611,8 @@ class SelfPlayTrainer:
                 
                 # Train less frequently but do more gradient steps per cycle
                 if len(self.replay_buffer) >= self.batch_size and episode_idx % episodes_per_train_step == 0:
-                    # Do 4 gradient updates per training cycle for better amortization
-                    for _ in range(4):
+                    # Do more gradient updates per training cycle to better utilize GPU
+                    for _ in range(16):
                         loss = self.train_step()
                         losses.append(loss)
                     
@@ -753,8 +753,8 @@ def main():
         model=model,
         #buffer_size=200000,  # Back to original size
         #batch_size=64,  # Back to original size
-        buffer_size=6000,  # Back to original size
-        batch_size=16,  # Back to original size
+        buffer_size=200000,
+        batch_size=256,
         learning_rate=1e-3,
         use_cuda=True  # Will use CUDA if available
     )
