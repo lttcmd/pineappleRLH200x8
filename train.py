@@ -25,6 +25,7 @@ _ENGINE_NUM_ENVS = int(os.getenv("OFC_ENGINE_NUM_ENVS", "0") or "0")
 _ENGINE_MAX_CAND = int(os.getenv("OFC_ENGINE_MAX_CANDIDATES", "0") or "0")
 _ENGINE_CYCLES = int(os.getenv("OFC_ENGINE_CYCLES", "0") or "0")
 _ENGINE_WORKERS = int(os.getenv("OFC_ENGINE_WORKERS", "0") or "0")
+_RUN_V2 = os.getenv("OFC_RUN_V2", "0") == "1"
 try:
     import ofc_cpp as _CPP
 except Exception:
@@ -663,6 +664,12 @@ class SelfPlayTrainer:
             episodes_per_update: How many episodes to collect before updating
             eval_frequency: How often to evaluate (in episodes)
         """
+        # Configure checkpoint prefix (v1 default, v2 new run)
+        checkpoint_prefix = 'value_net_checkpoint_ep'
+        if _RUN_V2:
+            resume = False
+            checkpoint_prefix = 'value_net_v2_ep'
+
         print(f"\n{'='*60}")
         print(f"Starting RL Training")
         print(f"{'='*60}")
@@ -722,9 +729,15 @@ class SelfPlayTrainer:
             # Calculate absolute episode number
             absolute_episode = start_episode + episode_idx
             
-            # Always random to maximize throughput
-            use_random_for_batch = not self.use_engine_policy
-            random_prob = 0.0 if self.use_engine_policy else 1.0
+            # Random/policy scheduling
+            if _RUN_V2:
+                progress = (absolute_episode - start_episode) / max(1, num_episodes)
+                random_prob = max(0.0, 1.0 - progress)  # 1.0 -> 0.0 over run
+                use_random_for_batch = (np.random.rand() < random_prob)
+            else:
+                # Legacy behavior
+                use_random_for_batch = not self.use_engine_policy
+                random_prob = 0.0 if self.use_engine_policy else 1.0
             
             # Generate batch of episodes
             if use_random_for_batch:
@@ -822,7 +835,7 @@ class SelfPlayTrainer:
                                   total_royalties=total_royalties, total_zero=total_zero,
                                   training_foul_rate=training_foul_rate,
                                   avg_score_per_hand=avg_score_per_hand)
-                    checkpoint_path = f'value_net_checkpoint_ep{absolute_episode}.pth'
+                    checkpoint_path = f'{checkpoint_prefix}{absolute_episode}.pth'
                     torch.save(self.model.state_dict(), checkpoint_path)
                     print(f"\nCheckpoint saved: {checkpoint_path}\n")
             else:
@@ -938,6 +951,20 @@ class SelfPlayTrainer:
                 # Restore model mode
                 if prev_training:
                     self.model.train()
+
+                # After serving policy batches, periodic evaluation/checkpoint
+                if absolute_episode > 0 and absolute_episode % eval_frequency == 0:
+                    pbar.clear()
+                    print(f"\n--- Evaluation at episode {absolute_episode:,} ---\n")
+                    training_foul_rate = (total_fouls / (absolute_episode + 1)) * 100 if absolute_episode > 0 else 0
+                    avg_score_per_hand = total_score / (absolute_episode + 1) if absolute_episode > 0 else 0.0
+                    self._evaluate(total_episodes=absolute_episode+1, total_fouls=total_fouls, 
+                                  total_royalties=total_royalties, total_zero=total_zero,
+                                  training_foul_rate=training_foul_rate,
+                                  avg_score_per_hand=avg_score_per_hand)
+                    checkpoint_path = f'{checkpoint_prefix}{absolute_episode}.pth'
+                    torch.save(self.model.state_dict(), checkpoint_path)
+                    print(f"\nCheckpoint saved: {checkpoint_path}\n")
         
         pbar.close()
         # Flush any remaining progress not reflected due to batching
@@ -1066,15 +1093,24 @@ def main():
     )
     
     try:
-        # Train for millions of hands
-        # Resume from latest checkpoint and target 5 million total hands
-        num_episodes = 500_000_000
-        
-        trainer.train(
-            num_episodes=num_episodes,
-            episodes_per_update=10,
-            eval_frequency=10000  # Evaluate and checkpoint every 10k hands
-        )
+        # Configure run
+        if os.getenv("OFC_RUN_V2", "0") == "1":
+            # Fresh run, 2.5M hands, checkpoint every 50k, no resume
+            num_episodes = 2_500_000
+            trainer.train(
+                num_episodes=num_episodes,
+                episodes_per_update=10,
+                eval_frequency=50_000,
+                resume=False
+            )
+        else:
+            # Legacy long run
+            num_episodes = 500_000_000
+            trainer.train(
+                num_episodes=num_episodes,
+                episodes_per_update=10,
+                eval_frequency=10000
+            )
         
         # Save final model
         torch.save(model.state_dict(), 'value_net.pth')
