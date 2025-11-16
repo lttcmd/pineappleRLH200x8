@@ -19,6 +19,7 @@ from multiprocessing import Pool, Process, Queue
 
 # Try optional C++ backend
 _USE_CPP = os.getenv("OFC_USE_CPP", "1") == "1"
+_USE_ENGINE_POLICY = os.getenv("OFC_USE_ENGINE_POLICY", "0") == "1"
 try:
     import ofc_cpp as _CPP
 except Exception:
@@ -225,6 +226,7 @@ class SelfPlayTrainer:
         # Set device (CUDA if available, else CPU)
         self.device = torch.device("cuda" if torch.cuda.is_available() and use_cuda else "cpu")
         self.model = self.model.to(self.device)
+        self.model.train()
         
         print(f"Using device: {self.device}")
         if self.device.type == "cuda":
@@ -257,6 +259,13 @@ class SelfPlayTrainer:
         # Centralized action serving infra (lazy init)
         self.request_queue: Optional[Queue] = None
         self.response_queues = None
+
+        # Engine-policy settings (Phase 2)
+        self.use_engine_policy = _USE_ENGINE_POLICY and (_CPP is not None)
+        # Configure default engine parameters
+        self.engine_num_envs = max(32, min(256, self.num_workers))  # spawn many envs
+        self.engine_max_candidates = 64
+        self.engine_cycles = 200  # request/apply cycles per run
     
     def generate_episode(self, use_random: bool = True, env_idx: int = 0) -> List[Tuple[State, float]]:
         """
@@ -460,6 +469,49 @@ class SelfPlayTrainer:
             # Slice view; store per-state rows
             for s in range(s0, s1):
                 self.replay_buffer.append((encoded_states[s], score))
+
+    def _engine_policy_generate_once(self, seed: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Run one engine-policy session: start envs, perform cycles of request->GPU forward->apply,
+        then collect encoded states and scores for completed episodes.
+        Returns (encoded [S,838], offsets [E+1], scores [E]).
+        """
+        assert _CPP is not None, "Engine policy requires C++ module"
+        # Create engine
+        h = _CPP.create_engine(np.uint64(seed))
+        try:
+            _CPP.engine_start_envs(h, int(self.engine_num_envs))
+            # Loop cycles
+            for _ in range(self.engine_cycles):
+                enc, meta = _CPP.request_policy_batch(h, int(self.engine_max_candidates))
+                # If no candidates, break
+                if enc.shape[0] == 0:
+                    break
+                # Forward on GPU
+                with torch.no_grad():
+                    x = torch.from_numpy(np.asarray(enc, dtype=np.float32))
+                    x = x.to(self.device, non_blocking=True)
+                    vals = self.model(x).squeeze()  # [T]
+                    vals_cpu = vals.detach().float().cpu().numpy()
+                # Pick best per env
+                best_by_env = {}
+                for i in range(meta.shape[0]):
+                    env_id = int(meta[i, 0]); action_id = int(meta[i, 1])
+                    v = vals_cpu[i]
+                    if (env_id not in best_by_env) or (v > best_by_env[env_id][0]):
+                        best_by_env[env_id] = (v, action_id)
+                if not best_by_env:
+                    break
+                chosen = np.array([[e, a] for e, (_, a) in best_by_env.items()], dtype=np.int32)
+                _CPP.apply_policy_actions(h, chosen)
+            # Collect outputs
+            enc2, offs, scores = _CPP.engine_collect_encoded_episodes(h)
+            enc2 = np.asarray(enc2, dtype=np.float32)
+            offs = np.asarray(offs, dtype=np.int32)
+            scores = np.asarray(scores, dtype=np.float32)
+            return enc2, offs, scores
+        finally:
+            _CPP.destroy_engine(h)
     
     def train_step(self) -> float:
         """
@@ -617,8 +669,8 @@ class SelfPlayTrainer:
             absolute_episode = start_episode + episode_idx
             
             # Always random to maximize throughput
-            use_random_for_batch = True
-            random_prob = 1.0
+            use_random_for_batch = not self.use_engine_policy
+            random_prob = 0.0 if self.use_engine_policy else 1.0
             
             # Generate batch of episodes
             if use_random_for_batch:
@@ -719,6 +771,55 @@ class SelfPlayTrainer:
                     checkpoint_path = f'value_net_checkpoint_ep{absolute_episode}.pth'
                     torch.save(self.model.state_dict(), checkpoint_path)
                     print(f"\nCheckpoint saved: {checkpoint_path}\n")
+            else:
+                # Engine policy path: GPU-assisted selection
+                seed = int(absolute_episode * 1000)
+                enc2, offs, scores = self._engine_policy_generate_once(seed)
+                # Update buffer and stats
+                if scores.shape[0] > 0:
+                    self.add_encoded_to_buffer(enc2, offs, scores)
+                    for final_score in scores.tolist():
+                        total_score += float(final_score)
+                        if final_score > 0:
+                            total_royalties += 1
+                            royalty_scores.append(float(final_score))
+                        elif final_score < 0:
+                            total_fouls += 1
+                        else:
+                            total_zero += 1
+                episodes_generated = int(scores.shape[0])
+                # Update progress and training using episodes_generated
+                for _ in range(episodes_generated):
+                    episode_idx += 1
+                    absolute_episode = start_episode + episode_idx - 1
+                    since_last_update += 1
+                    if since_last_update >= pbar_update_stride:
+                        pbar.update(since_last_update)
+                        since_last_update = 0
+                    if len(self.replay_buffer) >= self.batch_size and episode_idx % episodes_per_train_step == 0:
+                        for _ in range(updates_per_cycle):
+                            loss = self.train_step()
+                            losses.append(loss)
+                        avg_loss = np.mean(losses[-100:]) if losses else 0.0
+                        royalty_rate = (total_royalties / (absolute_episode + 1)) * 100 if absolute_episode > 0 else 0
+                        pbar.set_postfix({
+                            'loss': f'{avg_loss:.4f}',
+                            'buffer': len(self.replay_buffer),
+                            'random%': f'{random_prob*100:.1f}%',
+                            'royalties': f'{total_royalties} ({royalty_rate:.2f}%)'
+                        })
+                    if absolute_episode > 0 and absolute_episode % eval_frequency == 0:
+                        pbar.clear()
+                        print(f"\n--- Evaluation at episode {absolute_episode:,} ---\n")
+                        training_foul_rate = (total_fouls / (absolute_episode + 1)) * 100 if absolute_episode > 0 else 0
+                        avg_score_per_hand = total_score / (absolute_episode + 1) if absolute_episode > 0 else 0.0
+                        self._evaluate(total_episodes=absolute_episode+1, total_fouls=total_fouls, 
+                                      total_royalties=total_royalties, total_zero=total_zero,
+                                      training_foul_rate=training_foul_rate,
+                                      avg_score_per_hand=avg_score_per_hand)
+                        checkpoint_path = f'value_net_checkpoint_ep{absolute_episode}.pth'
+                        torch.save(self.model.state_dict(), checkpoint_path)
+                        print(f"\nCheckpoint saved: {checkpoint_path}\n")
         
         pbar.close()
         # Flush any remaining progress not reflected due to batching
