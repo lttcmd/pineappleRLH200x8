@@ -769,7 +769,7 @@ def main():
         trainer.train(
             num_episodes=num_episodes,
             episodes_per_update=10,
-            eval_frequency=10000  # Evaluate every 10k hands
+            eval_frequency=100000  # Evaluate and checkpoint every 100k hands
         )
         
         # Save final model
