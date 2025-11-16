@@ -8,6 +8,14 @@ from dataclasses import dataclass
 from itertools import permutations, combinations
 from ofc_types import Card, Rank, Suit
 from ofc_scoring import validate_board, score_board
+import os
+_USE_CPP = os.getenv("OFC_USE_CPP", "1") == "1"
+_CPP = None
+if _USE_CPP:
+    try:
+        import ofc_cpp as _CPP
+    except Exception:
+        _CPP = None
 
 
 # Heuristic caps to reduce CPU branching during action generation
@@ -97,6 +105,20 @@ class OfcEnv:
         In round 0: must place all 5 cards
         In rounds 1-4: choose 2 of 3 cards, place them
         """
+        # C++ accelerated path for rounds 1..4 to reduce Python overhead
+        if _CPP is not None and state.round > 0:
+            import numpy as _np
+            board_arr = _np.array([c.to_int() if c is not None else -1 for c in state.board], dtype=_np.int16)
+            keeps, places = _CPP.legal_actions_rounds1to4(board_arr, int(state.round))
+            legal: List[Action] = []
+            # Convert arrays to Action objects
+            for i in range(keeps.shape[0]):
+                k0 = int(keeps[i,0]); k1 = int(keeps[i,1])
+                p00 = int(places[i,0,0]); p01 = int(places[i,0,1])
+                p10 = int(places[i,1,0]); p11 = int(places[i,1,1])
+                legal.append(Action(keep_indices=(k0, k1), placements=[(p00, p01), (p10, p11)]))
+            return legal
+        
         legal = []
         
         if state.round == 0:
@@ -177,6 +199,41 @@ class OfcEnv:
         Optimized with minimal copying.
         Reward is 0 during play, final score computed at end.
         """
+        # C++ accelerated path for rounds 1..4
+        if _CPP is not None and state.round > 0:
+            import numpy as _np
+            # Prepare arrays for C++
+            board_arr = _np.array([c.to_int() if c is not None else -1 for c in state.board], dtype=_np.int16)
+            draw_arr = _np.full((3,), -1, dtype=_np.int16)
+            for i in range(min(3, len(state.current_draw))):
+                draw_arr[i] = state.current_draw[i].to_int()
+            deck_arr = _np.array([c.to_int() for c in state.deck], dtype=_np.int16)
+            keep_i, keep_j = action.keep_indices
+            (b2, new_round, d2, deck2, done) = _CPP.step_state(
+                board_arr, int(state.round), draw_arr, deck_arr,
+                int(keep_i), int(keep_j),
+                int(action.placements[0][0]), int(action.placements[0][1]),
+                int(action.placements[1][0]), int(action.placements[1][1])
+            )
+            # Convert back to Python State
+            from ofc_types import Card, Rank, Suit
+            def int_to_card(v: int):
+                rank = Rank((v // 4) + 2)
+                suit = Suit(v % 4)
+                return Card(rank, suit)
+            new_board = [int_to_card(int(v)) if int(v) >= 0 else None for v in b2.tolist()]
+            next_draw = [int_to_card(int(v)) for v in d2.tolist() if int(v) >= 0]
+            new_deck = [int_to_card(int(v)) for v in deck2.tolist()]
+            new_state = State(
+                board=new_board,
+                round=new_round,
+                current_draw=next_draw,
+                deck=new_deck,
+                cards_placed_this_round=len(action.placements)
+            )
+            return new_state, 0.0, bool(done)
+        
+        # Fallback to Python implementation
         # Fast copy using list() instead of .copy()
         new_board = list(state.board)
         new_deck = list(state.deck)
@@ -235,7 +292,16 @@ class OfcEnv:
         middle_cards = [state.board[i] for i in range(5, 10)]
         top_cards = [state.board[i] for i in range(10, 13)]
         
-        # Use proper OFC scoring
+        # Try C++ accelerated scoring if available
+        if _CPP is not None:
+            import numpy as _np
+            b = _np.array([c.to_int() for c in bottom_cards], dtype=_np.int16)
+            m = _np.array([c.to_int() for c in middle_cards], dtype=_np.int16)
+            t = _np.array([c.to_int() for c in top_cards], dtype=_np.int16)
+            s, fouled = _CPP.score_board_from_ints(b, m, t)
+            return float(s)
+        
+        # Fallback to Python scoring
         score, is_fouled = score_board(bottom_cards, middle_cards, top_cards)
         return score
 

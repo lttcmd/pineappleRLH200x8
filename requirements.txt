@@ -11,3 +11,8 @@ matplotlib>=3.7.0
 # Optional: For tensorboard logging
 tensorboard>=2.13.0
 
+# Build-time (for C++ extension)
+pybind11>=2.11.0
+scikit-build-core>=0.7.0
+setuptools>=68
+

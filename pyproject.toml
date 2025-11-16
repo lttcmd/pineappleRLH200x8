@@ -1,0 +1,19 @@
+[build-system]
+requires = ["scikit-build-core>=0.7.0", "pybind11>=2.11.0", "setuptools>=68"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "ofc-cpp"
+version = "0.1.0"
+description = "C++ accelerated components for OFC env"
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.scikit-build]
+minimum-version = "0.7"
+wheel.expand-macos-universal-tags = true
+
+[tool.scikit-build.cmake]
+build-type = "Release"
+
+
