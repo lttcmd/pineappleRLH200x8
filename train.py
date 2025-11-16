@@ -102,15 +102,17 @@ class SelfPlayTrainer:
         
         # Use multiple environments for parallel episode generation
         # This helps keep GPU busy while CPU generates episodes
-        self.num_envs = 16  # Number of parallel environments (increased for better throughput)
+        # Increased to better utilize many-core CPUs
+        self.num_envs = 64  # Number of parallel environments
         self.envs = [OfcEnv() for _ in range(self.num_envs)]
         
         # Use pinned memory for faster CPU->GPU transfer
         self.pin_memory = True if torch.cuda.is_available() and use_cuda else False
         
         # Multiprocessing pool for parallel episode generation
+        # Default: aggressively use available CPU cores
         if num_workers is None:
-            num_workers = max(1, mp.cpu_count() - 2)  # Leave 2 cores for GPU and main thread
+            num_workers = max(1, mp.cpu_count())  # Use all logical CPUs by default
         self.num_workers = num_workers
         self.pool = Pool(processes=num_workers)
         print(f"Multiprocessing: Using {num_workers} worker processes")
@@ -343,7 +345,8 @@ class SelfPlayTrainer:
         pbar = tqdm(range(start_episode, num_episodes), desc="Training", unit="hand", initial=start_episode, total=num_episodes)
         
         # Generate episodes in larger batches using multiprocessing for speed
-        episodes_per_batch = max(self.num_workers * 2, 16)  # Generate many episodes at once
+        # Aggressively scale batch size with number of workers to push CPU harder
+        episodes_per_batch = max(self.num_workers * 4, 32)  # Generate many episodes at once
         episodes_per_train_step = 8  # Train every N episodes
         
         episode_idx = 0
