@@ -15,9 +15,7 @@ import os
 import glob
 import re
 import multiprocessing as mp
-from multiprocessing import Pool, Process
-from multiprocessing import Manager
-from multiprocessing.queues import Queue
+from multiprocessing import Pool, Process, Queue
 
 from ofc_env import OfcEnv, State, Action
 from state_encoding import encode_state, encode_state_batch, get_input_dim
@@ -249,8 +247,7 @@ class SelfPlayTrainer:
         self.pool = Pool(processes=num_workers)
         print(f"Multiprocessing: Using {num_workers} worker processes")
         # Centralized action serving infra (lazy init)
-        self.manager = None
-        self.request_queue = None
+        self.request_queue: Optional[Queue] = None
         self.response_queues = None
     
     def generate_episode(self, use_random: bool = True, env_idx: int = 0) -> List[Tuple[State, float]]:
@@ -338,18 +335,17 @@ class SelfPlayTrainer:
         Parallel net-based episodes using env-only workers and a central GPU action server.
         Spawns up to num_workers processes, each producing one episode.
         """
-        if self.manager is None:
-            self.manager = Manager()
         if self.request_queue is None:
-            self.request_queue = self.manager.Queue()
+            # Use fast, process-shared Queue (avoid Manager proxies)
+            self.request_queue = Queue(maxsize=8192)
         self.response_queues = {}
         
         num_to_run = min(num_episodes, self.num_workers)
         # Create per-worker response queues
         for wid in range(num_to_run):
-            self.response_queues[wid] = self.manager.Queue()
+            self.response_queues[wid] = Queue(maxsize=1024)
         
-        out_q = self.manager.Queue()
+        out_q = Queue(maxsize=num_to_run)
         workers: List[Process] = []
         for wid in range(num_to_run):
             p = Process(
