@@ -18,14 +18,20 @@ py::tuple legal_actions_rounds1to4(py::array_t<int16_t> board, int round_idx) {
   if (b.shape(0) != 13) throw std::runtime_error("board must have 13 entries");
   if (round_idx <= 0) {
     // Not handled here; leave to Python
-    return py::make_tuple(py::array_t<int8_t>({0,2}), py::array_t<int16_t>({0,2,2}));
+    return py::make_tuple(
+      py::array_t<int8_t>(py::array::ShapeContainer{0,2}),
+      py::array_t<int16_t>(py::array::ShapeContainer{0,2,2})
+    );
   }
   // Collect empty slots
   std::vector<int16_t> empty;
   empty.reserve(13);
   for (int i=0;i<13;++i) if (b(i) == -1) empty.push_back(static_cast<int16_t>(i));
   if (empty.size() < 2) {
-    return py::make_tuple(py::array_t<int8_t>({0,2}), py::array_t<int16_t>({0,2,2}));
+    return py::make_tuple(
+      py::array_t<int8_t>(py::array::ShapeContainer{0,2}),
+      py::array_t<int16_t>(py::array::ShapeContainer{0,2,2})
+    );
   }
   // Subsample empty slots if large
   if (empty.size() > MAX_EMPTY_SLOTS_CONSIDERED) {
@@ -53,7 +59,10 @@ py::tuple legal_actions_rounds1to4(py::array_t<int16_t> board, int round_idx) {
   }
   int total = per_keep * 3;
   if (total <= 0) {
-    return py::make_tuple(py::array_t<int8_t>({0,2}), py::array_t<int16_t>({0,2,2}));
+    return py::make_tuple(
+      py::array_t<int8_t>(py::array::ShapeContainer{0,2}),
+      py::array_t<int16_t>(py::array::ShapeContainer{0,2,2})
+    );
   }
 
   auto keeps = py::array_t<int8_t>({total, 2});

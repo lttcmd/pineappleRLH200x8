@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <unordered_map>
+#include <set>
+#include <vector>
 
 namespace py = pybind11;
 
@@ -12,7 +14,7 @@ static inline int suit_from_int(int c) { return (c % 4); }       // 0..3
 
 static bool is_straight_5(const std::array<int,5>& ranks_sorted_desc) {
   // Convert to unique sorted ascending
-  std::array<int,5> tmp = ranks_sorted_desc;
+  std::vector<int> tmp(ranks_sorted_desc.begin(), ranks_sorted_desc.end());
   std::sort(tmp.begin(), tmp.end());
   tmp.erase(std::unique(tmp.begin(), tmp.end()), tmp.end());
   if (tmp.size() != 5) return false;
@@ -30,8 +32,8 @@ static std::string evaluate_5(const std::array<int,5>& ranks_desc, const std::ar
   std::array<int,5> suits_arr = suits;
   bool is_flush = (suits_arr[0]==suits_arr[1] && suits_arr[1]==suits_arr[2] && suits_arr[2]==suits_arr[3] && suits_arr[3]==suits_arr[4]);
   bool is_straight = is_straight_5(ranks);
-  bool is_royal = is_flush && (std::unordered_map<int,int>{{14,1},{13,1},{12,1},{11,1},{10,1}}.size()==5) && // quick check
-                  (std::set<int>(ranks.begin(), ranks.end()) == std::set<int>{14,13,12,11,10});
+  std::set<int> rset(ranks.begin(), ranks.end());
+  bool is_royal = is_flush && (rset == std::set<int>{14,13,12,11,10});
 
   if (is_royal) return "royal_flush";
   if (is_straight && is_flush) return "straight_flush";
