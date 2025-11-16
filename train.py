@@ -156,7 +156,7 @@ class ActionServer:
     def stop(self):
         self._running = False
 
-    def serve_once(self, timeout: float = 0.10) -> int:
+    def serve_once(self, timeout: float = 0.02) -> int:
         """
         Collect up to max_batch requests and serve them in one GPU forward.
         Returns number of requests served.
@@ -340,8 +340,8 @@ class SelfPlayTrainer:
             self.request_queue = Queue(maxsize=8192)
         self.response_queues = {}
         
-        # Limit concurrent env workers to reduce IPC contention and improve batching
-        num_to_run = min(num_episodes, max(4, self.num_workers // 3))
+        # Run up to the full number of workers to better keep the server busy
+        num_to_run = min(num_episodes, self.num_workers)
         # Create per-worker response queues
         for wid in range(num_to_run):
             self.response_queues[wid] = Queue(maxsize=1024)
