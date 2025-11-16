@@ -15,7 +15,9 @@ import os
 import glob
 import re
 import multiprocessing as mp
-from multiprocessing import Pool
+from multiprocessing import Pool, Process
+from multiprocessing import Manager
+from multiprocessing.queues import Queue
 
 from ofc_env import OfcEnv, State, Action
 from state_encoding import encode_state, encode_state_batch, get_input_dim
@@ -72,10 +74,123 @@ def _generate_episode_worker(seed: int) -> List[Tuple[State, float]]:
 
 def _generate_episode_with_net_worker(args: Tuple[int, dict]) -> List[Tuple[State, float]]:
     """
-    Placeholder for a future design where env workers request actions from a
-    central GPU model. Currently unused to avoid inefficient CUDA-in-worker usage.
+    Placeholder for future designs; not used in the centralized action server path.
     """
     raise NotImplementedError("Net-based worker episodes are not used in this version.")
+
+
+# Centralized GPU action serving components
+def _env_worker_requesting_actions(args):
+    """
+    Env-only worker: simulates one episode and requests actions from a central GPU server.
+    Communicates via request_queue (to send encoded batches) and response_queue (to receive best index).
+    """
+    worker_id, seed, request_queue, response_queue = args
+
+    random.seed(seed)
+    np.random.seed(seed)
+
+    env = OfcEnv()
+    state = env.reset()
+    episode_states = []
+    req_counter = 0
+
+    while True:
+        legal_actions = env.legal_actions(state)
+        if not legal_actions:
+            episode_states.append(state)
+            break
+
+        episode_states.append(state)
+
+        # Build candidate next states and encode on CPU
+        next_states = []
+        for action in legal_actions:
+            next_state, _, _ = env.step(state, action)
+            next_states.append(next_state)
+
+        encoded_batch = encode_state_batch(next_states).numpy()  # np.float32
+
+        request_id = (worker_id, req_counter)
+        req_counter += 1
+        request_queue.put((request_id, len(legal_actions), encoded_batch))
+
+        # Wait for best index
+        resp_request_id, best_idx = response_queue.get()
+        # Basic sanity: ensure response matches request
+        if resp_request_id != request_id:
+            while resp_request_id != request_id:
+                resp_request_id, best_idx = response_queue.get()
+
+        best_action = legal_actions[best_idx]
+        state, _, done = env.step(state, best_action)
+        if done:
+            episode_states.append(state)
+            break
+
+    final_score = env.score(state)
+    return [(s, final_score) for s in episode_states]
+
+
+class ActionServer:
+    """
+    Central GPU action server that batches requests from workers and runs one large
+    forward pass on the GPU, then replies with best indices.
+    """
+    def __init__(self, model: ValueNet, device: torch.device, request_queue: Queue, response_queues, max_batch: int = 2048):
+        self.model = model
+        self.device = device
+        self.request_queue = request_queue
+        self.response_queues = response_queues
+        self.max_batch = max_batch
+        self._running = True
+        self.model.eval()
+
+    def stop(self):
+        self._running = False
+
+    def serve_once(self, timeout: float = 0.02) -> int:
+        """
+        Collect up to max_batch requests and serve them in one GPU forward.
+        Returns number of requests served.
+        """
+        batch = []
+        try:
+            item = self.request_queue.get(timeout=timeout)
+            batch.append(item)
+        except Exception:
+            return 0
+
+        while len(batch) < self.max_batch:
+            try:
+                item = self.request_queue.get_nowait()
+                batch.append(item)
+            except Exception:
+                break
+
+        # Build mega batch
+        tensors = []
+        splits = []
+        req_ids = []
+        for (request_id, num_actions, encoded_np) in batch:
+            tensors.append(torch.from_numpy(encoded_np))
+            splits.append(num_actions)
+            req_ids.append(request_id)
+
+        mega = torch.cat(tensors, dim=0).to(self.device, non_blocking=True)
+        with torch.no_grad():
+            values = self.model(mega).squeeze()
+
+        # Respond
+        offset = 0
+        for request_id, num_actions in zip(req_ids, splits):
+            slice_vals = values[offset:offset+num_actions]
+            best_idx = 0 if slice_vals.dim() == 0 else int(slice_vals.argmax().item())
+            offset += num_actions
+            worker_id, _ = request_id
+            self.response_queues[worker_id].put((request_id, best_idx))
+
+        return len(batch)
 
 
 class SelfPlayTrainer:
@@ -124,6 +239,10 @@ class SelfPlayTrainer:
         self.num_workers = num_workers
         self.pool = Pool(processes=num_workers)
         print(f"Multiprocessing: Using {num_workers} worker processes")
+        # Centralized action serving infra (lazy init)
+        self.manager = None
+        self.request_queue = None
+        self.response_queues = None
     
     def generate_episode(self, use_random: bool = True, env_idx: int = 0) -> List[Tuple[State, float]]:
         """
@@ -204,6 +323,71 @@ class SelfPlayTrainer:
             all_data.extend(episode_data)
 
         return all_data
+    
+    def generate_episodes_parallel_with_server(self, num_episodes: int, base_seed: int = 0) -> List[List[Tuple[State, float]]]:
+        """
+        Parallel net-based episodes using env-only workers and a central GPU action server.
+        Spawns up to num_workers processes, each producing one episode.
+        """
+        if self.manager is None:
+            self.manager = Manager()
+        if self.request_queue is None:
+            self.request_queue = self.manager.Queue()
+        self.response_queues = {}
+        
+        num_to_run = min(num_episodes, self.num_workers)
+        # Create per-worker response queues
+        for wid in range(num_to_run):
+            self.response_queues[wid] = self.manager.Queue()
+        
+        # Wrapper to run one episode and put result into an output queue
+        def _run_one_episode(wid, seed, req_q, resp_q, out_q):
+            data = _env_worker_requesting_actions((wid, seed, req_q, resp_q))
+            out_q.put((wid, data))
+        
+        out_q = self.manager.Queue()
+        workers: List[Process] = []
+        for wid in range(num_to_run):
+            p = Process(
+                target=_run_one_episode,
+                args=(wid, base_seed + wid, self.request_queue, self.response_queues[wid], out_q)
+            )
+            p.daemon = True
+            workers.append(p)
+        
+        # Start action server in main process
+        server = ActionServer(self.model, self.device, self.request_queue, self.response_queues, max_batch=4096)
+        
+        # Start workers
+        for p in workers:
+            p.start()
+        
+        # Serve until all workers finish
+        finished = 0
+        episodes: List[List[Tuple[State, float]]] = []
+        while finished < num_to_run:
+            served = server.serve_once(timeout=0.02)
+            # Check for finished outputs
+            try:
+                wid, data = out_q.get_nowait()
+                episodes.append(data)
+                finished += 1
+            except Exception:
+                pass
+        
+        # Final quick drain
+        for _ in range(5):
+            if server.serve_once(timeout=0.0) == 0:
+                break
+        server.stop()
+        
+        # Cleanup workers
+        for p in workers:
+            p.join(timeout=0.1)
+            if p.is_alive():
+                p.terminate()
+        
+        return episodes
     
     def _choose_action_with_net(self, state: State, legal_actions: List[Action], env_idx: int = 0) -> Action:
         """Choose action using value network (greedy) - batched for GPU efficiency."""
@@ -392,12 +576,12 @@ class SelfPlayTrainer:
                 if current_ep:  # Add remaining
                     episodes_list.append(current_ep)
             else:
-                # Sequential generation for network-based episodes (keeps GPU usage efficient)
-                episodes_list = []
-                for i in range(batch_size_current):
-                    episode_data = self.generate_episode(use_random=False, env_idx=absolute_episode + i)
-                    if episode_data:
-                        episodes_list.append(episode_data)
+                # Parallel net-based episodes via centralized GPU action server
+                episodes_parallel = self.generate_episodes_parallel_with_server(
+                    num_episodes=batch_size_current,
+                    base_seed=absolute_episode * 2000
+                )
+                episodes_list = [ep for ep in episodes_parallel if ep]
             
             # Process each episode
             for episode_data in episodes_list:
