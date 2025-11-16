@@ -50,6 +50,11 @@ struct EnvState {
 struct Engine {
   std::mt19937_64 rng;
   std::vector<EnvState> envs;
+  // Accumulation buffers for selected next-state encodings and episode summaries
+  std::vector<float> enc_all;            // flat [S*838]
+  std::vector<int32_t> episode_offsets;  // [E+1], starts with 0
+  std::vector<float> final_scores;       // [E]
+  std::vector<int32_t> env_counts;       // per-env states emitted in current episode
   Engine(uint64_t seed) : rng(seed) {}
 };
 
@@ -76,6 +81,11 @@ void engine_start_envs(uint64_t handle, int num_envs) {
   Engine* eng = it->second;
   eng->envs.clear();
   eng->envs.resize(num_envs);
+  eng->enc_all.clear();
+  eng->final_scores.clear();
+  eng->episode_offsets.clear();
+  eng->episode_offsets.push_back(0);
+  eng->env_counts.assign(num_envs, 0);
   for (int e=0;e<num_envs;++e) {
     EnvState& st = eng->envs[e];
     st.board.fill(-1);
@@ -307,8 +317,83 @@ int apply_policy_actions(uint64_t handle, py::array_t<int32_t> chosen) {
     }
     // Clear last actions to force new request on next cycle
     st.last_actions.clear();
+
+    // Append selected next-state encoding (after step) into engine buffer
+    // Build single-row arrays to reuse existing encoder
+    // Boards
+    auto boards_np = py::array_t<int16_t>({1, (ssize_t)13});
+    auto B = boards_np.mutable_unchecked<2>();
+    for (int j=0;j<13;++j) B(0,j) = st.board[j];
+    auto rounds_np = py::array_t<int8_t>({1});
+    auto R = rounds_np.mutable_unchecked<1>();
+    R(0) = (int8_t)st.round_idx;
+    auto draws_np = py::array_t<int16_t>({1, (ssize_t)3});
+    auto D = draws_np.mutable_unchecked<2>();
+    for (int j=0;j<3;++j) D(0,j) = st.draw3[j];
+    auto deck_np = py::array_t<int16_t>({1});
+    auto L = deck_np.mutable_unchecked<1>();
+    L(0) = (int16_t)st.deck.size();
+    py::array_t<float> enc_row = encode_state_batch_ints(boards_np, rounds_np, draws_np, deck_np);
+    auto Erow = enc_row.unchecked<2>();
+    for (int k=0;k<838;++k) eng->enc_all.push_back(Erow(0,k));
+    // Update per-env count
+    if (env_id >= 0 && env_id < (int)eng->env_counts.size()) {
+      eng->env_counts[env_id] += 1;
+    }
+
+    // If env finished, compute score and close episode
+    if (st.done) {
+      // Score final board
+      py::array_t<int16_t> bottom({5}), middle({5}), top({3});
+      auto br = bottom.mutable_unchecked<1>();
+      auto mr = middle.mutable_unchecked<1>();
+      auto tr = top.mutable_unchecked<1>();
+      for (int j=0;j<5;++j) br(j)=st.board[j];
+      for (int j=0;j<5;++j) mr(j)=st.board[5+j];
+      for (int j=0;j<3;++j) tr(j)=st.board[10+j];
+      auto sc = score_board_from_ints(bottom, middle, top);
+      eng->final_scores.push_back(sc.first);
+      // Advance offsets
+      int32_t last = eng->episode_offsets.empty() ? 0 : eng->episode_offsets.back();
+      int32_t add = (env_id >=0 && env_id < (int)eng->env_counts.size()) ? eng->env_counts[env_id] : 0;
+      eng->episode_offsets.push_back(last + add);
+      if (env_id >=0 && env_id < (int)eng->env_counts.size()) eng->env_counts[env_id] = 0;
+    }
   }
   return stepped;
+}
+
+// Collect accumulated selected encodings and final scores; clears buffers.
+py::tuple engine_collect_encoded_episodes(uint64_t handle) {
+  auto it = g_engines.find(handle);
+  if (it==g_engines.end()) throw std::runtime_error("invalid engine handle");
+  Engine* eng = it->second;
+  // Build outputs
+  ssize_t S = (ssize_t)(eng->enc_all.size() / 838);
+  auto enc = py::array_t<float>({S, (ssize_t)838});
+  if (S > 0) {
+    auto E = enc.mutable_unchecked<2>();
+    ssize_t idx = 0;
+    for (ssize_t s=0;s<S;++s) {
+      for (int k=0;k<838;++k) E(s,k) = eng->enc_all[idx++];
+    }
+  }
+  auto offs = py::array_t<int32_t>({(ssize_t)eng->episode_offsets.size()});
+  {
+    auto O = offs.mutable_unchecked<1>();
+    for (ssize_t i=0;i<(ssize_t)eng->episode_offsets.size();++i) O(i)=eng->episode_offsets[i];
+  }
+  auto scores = py::array_t<float>({(ssize_t)eng->final_scores.size()});
+  {
+    auto Sarr = scores.mutable_unchecked<1>();
+    for (ssize_t i=0;i<(ssize_t)eng->final_scores.size();++i) Sarr(i)=eng->final_scores[i];
+  }
+  // Clear buffers for next cycle; keep offsets starting at 0
+  eng->enc_all.clear();
+  eng->final_scores.clear();
+  eng->episode_offsets.clear();
+  eng->episode_offsets.push_back(0);
+  return py::make_tuple(enc, offs, scores);
 }
 
 // Generate random episodes end-to-end and return encoded states

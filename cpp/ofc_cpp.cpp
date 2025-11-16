@@ -37,6 +37,7 @@ void destroy_engine(uint64_t handle);
 void engine_start_envs(uint64_t handle, int num_envs);
 py::tuple request_policy_batch(uint64_t handle, int max_candidates_per_env);
 int apply_policy_actions(uint64_t handle, py::array_t<int32_t> chosen);
+py::tuple engine_collect_encoded_episodes(uint64_t handle);
 
 PYBIND11_MODULE(ofc_cpp, m) {
   m.doc() = "C++ accelerated OFC helpers";
@@ -77,6 +78,8 @@ PYBIND11_MODULE(ofc_cpp, m) {
         "Return (encoded_candidates [T,838], meta [T,3] int32: env_id, action_id, candidate_idx).");
   m.def("apply_policy_actions", &apply_policy_actions, py::arg("handle"), py::arg("chosen"),
         "Apply chosen actions array [N,2] int32 of (env_id, action_id). Returns number stepped.");
+  m.def("engine_collect_encoded_episodes", &engine_collect_encoded_episodes, py::arg("handle"),
+        "Collect accumulated selected encodings and scores; returns (encoded [S,838], offsets [E+1], scores [E]) and clears buffers.");
 }
 
 
