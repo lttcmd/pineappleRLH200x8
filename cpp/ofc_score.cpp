@@ -160,7 +160,7 @@ std::pair<float, bool> score_board_from_ints(py::array_t<int16_t> bottom,
   for (int i=0;i<5;++i){ mr[i]=rank_from_int(m(i)); ms[i]=suit_from_int(m(i)); }
   for (int i=0;i<3;++i){ tr[i]=rank_from_int(t(i)); }
   bool valid = validate_board(br,bs,mr,ms,tr);
-  if (!valid) return {-3.0f, true};
+  if (!valid) return {-6.0f, true};
   int roy = royalties_five(br,bs,false) + royalties_five(mr,ms,true) + std::max(top_pair_royalty(tr), top_trips_royalty(tr));
   return {static_cast<float>(roy), false};
 }

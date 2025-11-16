@@ -9,7 +9,6 @@ import random
 from collections import deque
 from typing import List, Tuple, Optional
 import numpy as np
-import itertools
 from tqdm import tqdm
 import time
 import os
@@ -21,13 +20,6 @@ from multiprocessing import Pool, Process, Queue
 # Try optional C++ backend
 _USE_CPP = os.getenv("OFC_USE_CPP", "1") == "1"
 _USE_ENGINE_POLICY = os.getenv("OFC_USE_ENGINE_POLICY", "0") == "1"
-# Runtime tunables for throughput/control
-_ENGINE_START_PROGRESS = float(os.getenv("OFC_ENGINE_START_PROGRESS", "0.5") or "0.5")  # use policy after 50% by default
-_ENGINE_NUM_ENVS = int(os.getenv("OFC_ENGINE_NUM_ENVS", "0") or "0")
-_ENGINE_MAX_CANDIDATES = int(os.getenv("OFC_ENGINE_MAX_CANDIDATES", "0") or "0")
-_ENGINE_CYCLES = int(os.getenv("OFC_ENGINE_CYCLES", "0") or "0")
-_TRAIN_EPISODES_PER_STEP = int(os.getenv("OFC_TRAIN_EPISODES_PER_STEP", "0") or "0")
-_TRAIN_UPDATES_PER_CYCLE = int(os.getenv("OFC_TRAIN_UPDATES_PER_CYCLE", "0") or "0")
 try:
     import ofc_cpp as _CPP
 except Exception:
@@ -225,7 +217,7 @@ class SelfPlayTrainer:
         model: ValueNet,
         buffer_size: int = 10000,
         batch_size: int = 64,
-        learning_rate: float = 3e-4,
+        learning_rate: float = 1e-3,
         use_cuda: bool = True,
         num_workers: int = None
     ):
@@ -245,7 +237,7 @@ class SelfPlayTrainer:
         self.batch_size = batch_size
         self.replay_buffer = deque(maxlen=buffer_size)
         
-        self.optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+        self.optimizer = optim.Adam(model.parameters(), lr=learning_rate)
         self.criterion = nn.MSELoss()
         
         # Use multiple environments for parallel episode generation
@@ -271,14 +263,9 @@ class SelfPlayTrainer:
         # Engine-policy settings (Phase 2)
         self.use_engine_policy = _USE_ENGINE_POLICY and (_CPP is not None)
         # Configure default engine parameters
-        default_envs = max(32, min(256, self.num_workers))
-        self.engine_num_envs = _ENGINE_NUM_ENVS if _ENGINE_NUM_ENVS > 0 else default_envs
-        self.engine_max_candidates = _ENGINE_MAX_CANDIDATES if _ENGINE_MAX_CANDIDATES > 0 else 128
-        self.engine_cycles = _ENGINE_CYCLES if _ENGINE_CYCLES > 0 else 200  # request/apply cycles per run
-        # Target normalization (EMA)
-        self.score_mean_ema = 0.0
-        self.score_var_ema = 1.0
-        self.score_ema_decay = 0.99
+        self.engine_num_envs = max(32, min(256, self.num_workers))  # spawn many envs
+        self.engine_max_candidates = 64
+        self.engine_cycles = 200  # request/apply cycles per run
     
     def generate_episode(self, use_random: bool = True, env_idx: int = 0) -> List[Tuple[State, float]]:
         """
@@ -536,16 +523,8 @@ class SelfPlayTrainer:
         if len(self.replay_buffer) < self.batch_size:
             return 0.0
         
-        # Sample batch with freshness bias: half from most recent 10% of buffer
-        n = len(self.replay_buffer)
-        recent_span = max(self.batch_size, int(0.1 * n))
-        recent_start = max(0, n - recent_span)
-        # Convert deque slice to list
-        recent_pool = list(itertools.islice(self.replay_buffer, recent_start, n))
-        half = self.batch_size // 2
-        batch_recent = [recent_pool[random.randrange(len(recent_pool))] for _ in range(half)] if recent_pool else []
-        batch_random = random.sample(self.replay_buffer, self.batch_size - len(batch_recent))
-        batch = batch_recent + batch_random
+        # Sample batch
+        batch = random.sample(self.replay_buffer, self.batch_size)
         
         # Extract states and scores
         states = [s for s, _ in batch]
@@ -566,16 +545,6 @@ class SelfPlayTrainer:
                 # Fallback: try through encoder (handles lists)
                 state_batch = encode_state_batch(states)
         targets = torch.tensor(scores, dtype=torch.float32).unsqueeze(1)
-        # Clip and normalize targets using EMA stats
-        targets = torch.clamp(targets, -20.0, 20.0)
-        with torch.no_grad():
-            batch_mean = targets.mean().item()
-            batch_var = targets.var(unbiased=False).item() + 1e-6
-            self.score_mean_ema = self.score_ema_decay * self.score_mean_ema + (1 - self.score_ema_decay) * batch_mean
-            self.score_var_ema = self.score_ema_decay * self.score_var_ema + (1 - self.score_ema_decay) * batch_var
-            norm_mean = self.score_mean_ema
-            norm_std = float(self.score_var_ema) ** 0.5
-        targets = (targets - norm_mean) / max(norm_std, 1e-3)
         
         # Move to device with pinned memory for faster transfer
         if self.pin_memory:
@@ -682,9 +651,9 @@ class SelfPlayTrainer:
         
         # Generate episodes in batches sized to reduce blocking pauses
         episodes_per_batch = max(self.num_workers, 32)  # Smaller batches for smoother progress
-        # Train cadence (env-overridable)
-        episodes_per_train_step = _TRAIN_EPISODES_PER_STEP if _TRAIN_EPISODES_PER_STEP > 0 else 10_000
-        updates_per_cycle = _TRAIN_UPDATES_PER_CYCLE if _TRAIN_UPDATES_PER_CYCLE > 0 else 1024
+        # Run long generation bursts, then do a large training burst
+        episodes_per_train_step = 100_000  # Generate 100k hands, then train
+        updates_per_cycle = 128  # Number of gradient updates after each 100k hands
         
         episode_idx = 0
         # Reduce UI overhead: batch progress bar updates
@@ -700,20 +669,8 @@ class SelfPlayTrainer:
             absolute_episode = start_episode + episode_idx
             
             # Always random to maximize throughput
-            if self.use_engine_policy:
-                # Anneal random probability linearly from 1.0 -> 0.0 over the run,
-                # but don't enable policy until ENGINE_START_PROGRESS threshold
-                progress = (absolute_episode - start_episode) / max(1, num_episodes)
-                if progress < _ENGINE_START_PROGRESS:
-                    use_random_for_batch = True
-                    random_prob = 1.0
-                else:
-                    random_prob = max(0.0, min(1.0, 1.0 - progress))
-                    use_random_for_batch = (np.random.rand() < random_prob)
-            else:
-                # Engine policy disabled: keep 100% random
-                use_random_for_batch = True
-                random_prob = 1.0
+            use_random_for_batch = not self.use_engine_policy
+            random_prob = 0.0 if self.use_engine_policy else 1.0
             
             # Generate batch of episodes
             if use_random_for_batch:
@@ -901,7 +858,7 @@ class SelfPlayTrainer:
         complete_boards = 0
         
         with torch.no_grad():
-            for _ in range(1000):  # Evaluate on 1000 hands for stability
+            for _ in range(50):  # More episodes for better stats
                 episode_data = self.generate_episode(use_random=False)
                 if episode_data:
                     final_score = episode_data[-1][1]
@@ -943,7 +900,7 @@ class SelfPlayTrainer:
                 print()
             
             print(f"{'='*23}")
-            print(f"Evaluation Statistics: (1000 test hands)")
+            print(f"Evaluation Statistics: (50 test hands)")
             print(f"  Avg score: {avg_score:.2f} ± {std_score:.2f}")
             print(f"  Range: [{min_score:.1f}, {max_score:.1f}]")
             print(f"  Foul rate: {foul_rate:.1f}%")
@@ -986,14 +943,14 @@ def main():
     )
     
     try:
-        # Fresh 10,000,000-hand run; anneal random->policy; checkpoint every 50k
-        num_episodes = 10_000_000
+        # Train for millions of hands
+        # Resume from latest checkpoint and target 5 million total hands
+        num_episodes = 500_000_000
         
         trainer.train(
             num_episodes=num_episodes,
             episodes_per_update=10,
-            eval_frequency=50_000,  # Evaluate and checkpoint every 50k hands
-            resume=False
+            eval_frequency=1000000  # Evaluate and checkpoint every 1M hands
         )
         
         # Save final model
