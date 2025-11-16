@@ -132,12 +132,11 @@ def _env_worker_requesting_actions(args):
     return [(s, final_score) for s in episode_states]
 
 
-def _run_one_episode(args):
+def _run_one_episode(wid, seed, request_q, response_q, out_q):
     """
     Top-level wrapper so it is picklable under 'spawn'.
     Runs a single episode using the env-only worker and returns data via out_q.
     """
-    wid, seed, request_q, response_q, out_q = args
     data = _env_worker_requesting_actions((wid, seed, request_q, response_q))
     out_q.put((wid, data))
 
