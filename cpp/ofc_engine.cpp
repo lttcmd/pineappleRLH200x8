@@ -321,16 +321,16 @@ int apply_policy_actions(uint64_t handle, py::array_t<int32_t> chosen) {
     // Append selected next-state encoding (after step) into engine buffer
     // Build single-row arrays to reuse existing encoder
     // Boards
-    auto boards_np = py::array_t<int16_t>({1, (ssize_t)13});
+    auto boards_np = py::array_t<int16_t>(py::array::ShapeContainer{(ssize_t)1, (ssize_t)13});
     auto B = boards_np.mutable_unchecked<2>();
     for (int j=0;j<13;++j) B(0,j) = st.board[j];
-    auto rounds_np = py::array_t<int8_t>({1});
+    auto rounds_np = py::array_t<int8_t>(py::array::ShapeContainer{(ssize_t)1});
     auto R = rounds_np.mutable_unchecked<1>();
     R(0) = (int8_t)st.round_idx;
-    auto draws_np = py::array_t<int16_t>({1, (ssize_t)3});
+    auto draws_np = py::array_t<int16_t>(py::array::ShapeContainer{(ssize_t)1, (ssize_t)3});
     auto D = draws_np.mutable_unchecked<2>();
     for (int j=0;j<3;++j) D(0,j) = st.draw3[j];
-    auto deck_np = py::array_t<int16_t>({1});
+    auto deck_np = py::array_t<int16_t>(py::array::ShapeContainer{(ssize_t)1});
     auto L = deck_np.mutable_unchecked<1>();
     L(0) = (int16_t)st.deck.size();
     py::array_t<float> enc_row = encode_state_batch_ints(boards_np, rounds_np, draws_np, deck_np);
