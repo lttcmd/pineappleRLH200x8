@@ -660,5 +660,7 @@ def main():
 
 
 if __name__ == '__main__':
+    # Use 'spawn' start method so CUDA can be safely used in worker processes
+    mp.set_start_method('spawn', force=True)
     main()
 
