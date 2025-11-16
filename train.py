@@ -319,14 +319,17 @@ class SelfPlayTrainer:
                 all_data.extend(episode_data)
             return all_data
 
-        # Generate random episodes in parallel using multiprocessing
+        # Generate random episodes in parallel using multiprocessing (streamed)
         seeds = [base_seed + i for i in range(num_episodes)]
-        episode_results = self.pool.map(_generate_episode_worker, seeds)
-
-        # Flatten results
         all_data = []
-        for episode_data in episode_results:
-            all_data.extend(episode_data)
+        try:
+            for episode_data in self.pool.imap_unordered(_generate_episode_worker, seeds, chunksize=1):
+                all_data.extend(episode_data)
+        except Exception:
+            # Fallback to non-streaming map if imap_unordered unavailable
+            episode_results = self.pool.map(_generate_episode_worker, seeds)
+            for episode_data in episode_results:
+                all_data.extend(episode_data)
 
         return all_data
     
@@ -544,9 +547,8 @@ class SelfPlayTrainer:
         # Progress bar for episodes (starting from resume point)
         pbar = tqdm(range(start_episode, num_episodes), desc="Training", unit="hand", initial=start_episode, total=num_episodes)
         
-        # Generate episodes in larger batches using multiprocessing for speed
-        # Aggressively scale batch size with number of workers to push CPU harder
-        episodes_per_batch = max(self.num_workers * 8, 64)  # Generate many episodes at once
+        # Generate episodes in batches sized to reduce blocking pauses
+        episodes_per_batch = max(self.num_workers, 32)  # Smaller batches for smoother progress
         # Run long generation bursts, then do a large training burst
         episodes_per_train_step = 100_000  # Generate 100k hands, then train
         updates_per_cycle = 128  # Number of gradient updates after each 100k hands
