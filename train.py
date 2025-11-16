@@ -545,7 +545,16 @@ class SelfPlayTrainer:
                 print(f"Will train for {num_episodes - start_episode:,} more episodes (total target: {num_episodes:,})")
         
         # Progress bar for episodes (starting from resume point)
-        pbar = tqdm(range(start_episode, num_episodes), desc="Training", unit="hand", initial=start_episode, total=num_episodes)
+        pbar = tqdm(
+            range(start_episode, num_episodes),
+            desc="Training",
+            unit="hand",
+            initial=start_episode,
+            total=num_episodes,
+            mininterval=0.5,
+            smoothing=0.0,
+            dynamic_ncols=False
+        )
         
         # Generate episodes in batches sized to reduce blocking pauses
         episodes_per_batch = max(self.num_workers, 32)  # Smaller batches for smoother progress
@@ -554,6 +563,9 @@ class SelfPlayTrainer:
         updates_per_cycle = 128  # Number of gradient updates after each 100k hands
         
         episode_idx = 0
+        # Reduce UI overhead: batch progress bar updates
+        pbar_update_stride = 512
+        since_last_update = 0
         # Throughput-first: 100% random batches for maximum hands/sec
         while start_episode + episode_idx < num_episodes:
             # Calculate how many episodes to generate in this batch
@@ -613,7 +625,10 @@ class SelfPlayTrainer:
                 # Update progress
                 episode_idx += 1
                 absolute_episode = start_episode + episode_idx - 1
-                pbar.update(1)
+                since_last_update += 1
+                if since_last_update >= pbar_update_stride:
+                    pbar.update(since_last_update)
+                    since_last_update = 0
                 
                 # Train in bursts after large generation windows
                 if len(self.replay_buffer) >= self.batch_size and episode_idx % episodes_per_train_step == 0:
@@ -651,6 +666,12 @@ class SelfPlayTrainer:
                     print(f"\nCheckpoint saved: {checkpoint_path}\n")
         
         pbar.close()
+        # Flush any remaining progress not reflected due to batching
+        if since_last_update > 0:
+            try:
+                pbar.update(since_last_update)
+            except Exception:
+                pass
         
         # Final evaluation
         print(f"\n{'='*60}")
