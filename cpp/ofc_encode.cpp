@@ -3,6 +3,11 @@
 #include <cstdint>
 #include <algorithm>
 
+// Windows compatibility: ssize_t is not available on MSVC, use Py_ssize_t instead
+#ifdef _WIN32
+typedef Py_ssize_t ssize_t;
+#endif
+
 namespace py = pybind11;
 
 // Encoding layout:

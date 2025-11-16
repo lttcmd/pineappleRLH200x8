@@ -66,7 +66,9 @@ class Action:
 class OfcEnv:
     """Open Face Chinese Poker Environment."""
     
-    def __init__(self):
+    def __init__(self, soft_mask: bool = True):
+        # If True, filter obviously foul-prone actions via cheap feasibility checks
+        self.soft_mask = soft_mask
         self.reset()
     
     def _create_deck(self) -> List[Card]:
@@ -117,6 +119,12 @@ class OfcEnv:
                 p00 = int(places[i,0,0]); p01 = int(places[i,0,1])
                 p10 = int(places[i,1,0]); p11 = int(places[i,1,1])
                 legal.append(Action(keep_indices=(k0, k1), placements=[(p00, p01), (p10, p11)]))
+            if self.soft_mask:
+                legal_filtered = [a for a in legal if self._feasible(state, a)]
+                # Safety: if mask filters out everything, return original list
+                if not legal_filtered and legal:
+                    return legal
+                legal = legal_filtered
             return legal
         
         legal = []
@@ -130,6 +138,8 @@ class OfcEnv:
                 for i in range(placements.shape[0]):
                     placement5 = [(int(placements[i,j,0]), int(placements[i,j,1])) for j in range(5)]
                     legal.append(Action(keep_indices=tuple(range(5)), placements=placement5))
+                if self.soft_mask:
+                    legal = [a for a in legal if self._feasible(state, a)]
                 return legal
             # Fallback Python path
             legal = []
@@ -173,6 +183,14 @@ class OfcEnv:
                     if pair_count >= MAX_SLOT_COMBOS_PER_PAIR:
                         break
         
+        if self.soft_mask:
+            legal_filtered = [a for a in legal if self._feasible(state, a)]
+            # Safety: if mask filters out everything but we have empty slots, return original list
+            # This prevents getting stuck when the mask is too aggressive
+            if not legal_filtered and legal and (state.round == 0 or len([i for i in range(13) if state.board[i] is None]) >= 2):
+                # Mask too aggressive, return unfiltered actions
+                return legal
+            legal = legal_filtered
         return legal
     
     def _is_valid_placement(self, state: State, placements: List[Tuple[int, int]], 
@@ -193,6 +211,85 @@ class OfcEnv:
         # Full validation (bottom > middle > top) only happens at scoring time
         # This allows games to complete even if the final board will be fouled
         # The model learns from both fouled and non-fouled outcomes
+        return True
+    
+    def _feasible(self, state: State, action: Action) -> bool:
+        """
+        Cheap feasibility screen to avoid locking in obvious fouls.
+        Strategy:
+          - Simulate placements onto a copy of the board.
+          - If any two rows become complete, ensure their relative ordering
+            cannot already violate OFC constraints (middle > top, bottom > middle).
+          - Otherwise, pass through.
+        This removes actions that immediately cement an irreparable foul.
+        """
+        # Fast copy
+        board = list(state.board)
+        try:
+            if state.round == 0:
+                # 5 placements: indices refer to current_draw positions [0..4]
+                for card_idx, slot_idx in action.placements:
+                    if board[slot_idx] is not None:
+                        return False
+                    board[slot_idx] = state.current_draw[card_idx]
+            else:
+                kept_cards = [state.current_draw[i] for i in action.keep_indices]
+                for keep_idx, slot_idx in action.placements:
+                    if board[slot_idx] is not None:
+                        return False
+                    board[slot_idx] = kept_cards[keep_idx]
+        except Exception:
+            # Any indexing issue: treat as infeasible
+            return False
+        
+        # Build row views
+        bottom = [board[i] for i in range(5)]
+        middle = [board[i] for i in range(5, 10)]
+        top = [board[i] for i in range(10, 13)]
+        
+        # If both top and middle are complete, they must respect ordering
+        top_complete = all(c is not None for c in top)
+        mid_complete = all(c is not None for c in middle)
+        bot_complete = all(c is not None for c in bottom)
+        
+        # If any pair of adjacent rows is complete, we can perform a definitive check
+        # Filter out None values before validation
+        if top_complete and mid_complete and bot_complete:
+            bottom_clean = [c for c in bottom if c is not None]
+            middle_clean = [c for c in middle if c is not None]
+            top_clean = [c for c in top if c is not None]
+            is_valid, _ = validate_board(bottom_clean, middle_clean, top_clean)
+            return is_valid
+        if top_complete and mid_complete:
+            # Complete check for middle > top using full validation by padding bottom minimally.
+            bottom_clean = [c for c in bottom if c is not None]
+            middle_clean = [c for c in middle if c is not None]
+            top_clean = [c for c in top if c is not None]
+            is_valid, _ = validate_board(bottom_clean, middle_clean, top_clean)
+            return is_valid
+        if mid_complete and bot_complete:
+            # Check bottom > middle
+            bottom_clean = [c for c in bottom if c is not None]
+            middle_clean = [c for c in middle if c is not None]
+            top_clean = [c for c in top if c is not None]
+            is_valid, _ = validate_board(bottom_clean, middle_clean, top_clean)
+            return is_valid
+        
+        # Heuristic: avoid making trips on top too early when middle has too few slots left
+        if state.round > 0 and any(slot is None for slot in middle):
+            # Count ranks on top
+            from collections import Counter
+            ranks_top = [c.rank for c in top if c is not None]
+            cnt = Counter(ranks_top)
+            if any(v >= 3 for v in cnt.values()):
+                # If trips formed on top but middle has <=2 empty slots and no pair/trips yet, risky
+                mid_ranks = [c.rank for c in middle if c is not None]
+                mid_cnt = Counter(mid_ranks)
+                mid_strength = max([v for v in mid_cnt.values()] + [1])
+                empty_mid = sum(1 for c in middle if c is None)
+                if empty_mid <= 2 and mid_strength < 2:
+                    return False
+        
         return True
     
     def step(self, state: State, action: Action) -> Tuple[State, float, bool]:

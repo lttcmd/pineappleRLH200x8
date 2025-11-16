@@ -4,6 +4,11 @@
 #include <array>
 #include <cstdint>
 
+// Windows compatibility: ssize_t is not available on MSVC, use Py_ssize_t instead
+#ifdef _WIN32
+typedef Py_ssize_t ssize_t;
+#endif
+
 namespace py = pybind11;
 
 // step_state:
@@ -63,13 +68,12 @@ py::tuple step_state(py::array_t<int16_t> board,
 
     // Place according to placements
     // placeX_keep_idx is 0 or 1 (which of kept), placeX_slot is 0..12
-    if (place0_slot>=0 && place0_slot<13 && b[place0_slot] == -1) {
-      int ki = (place0_keep_idx==0)?0:1;
-      b[place0_slot] = kept[ki];
+    // Ensure we use the correct kept card index
+    if (place0_slot>=0 && place0_slot<13 && b[place0_slot] == -1 && place0_keep_idx>=0 && place0_keep_idx<2) {
+      b[place0_slot] = kept[place0_keep_idx];
     }
-    if (place1_slot>=0 && place1_slot<13 && b[place1_slot] == -1) {
-      int ki = (place1_keep_idx==0)?0:1;
-      b[place1_slot] = kept[ki];
+    if (place1_slot>=0 && place1_slot<13 && b[place1_slot] == -1 && place1_keep_idx>=0 && place1_keep_idx<2) {
+      b[place1_slot] = kept[place1_keep_idx];
     }
 
     // Advance round
@@ -113,21 +117,35 @@ py::tuple step_state_round0(py::array_t<int16_t> board,
                             py::array_t<int16_t> current5,
                             py::array_t<int16_t> deck,
                             py::array_t<int16_t> slots5) {
+  // Validate shapes
+  if (board.shape(0) != 13) throw std::runtime_error("board must have 13 elements");
+  if (current5.shape(0) != 5) throw std::runtime_error("current5 must have 5 elements");
+  if (slots5.shape(0) != 5) throw std::runtime_error("slots5 must have 5 elements");
+  
   auto b_in = board.unchecked<1>();
   auto d_in = deck.unchecked<1>();
   auto c5 = current5.unchecked<1>();
   auto sl = slots5.unchecked<1>(); // shape (5,)
 
-  std::array<int16_t,13> b{};
-  for (int i=0;i<13;++i) b[i] = b_in(i);
+  // Initialize board from input (all should be -1 for empty)
+  std::array<int16_t,13> b;
+  for (int i=0;i<13;++i) {
+    b[i] = b_in(i);
+  }
   std::vector<int16_t> d(d_in.shape(0));
   for (ssize_t i=0;i<d_in.shape(0);++i) d[i] = d_in(i);
 
   // Place all 5: card index i goes to slots5[i]
+  // DEBUG: Test if output mechanism works with manual values
+  // Uncomment below to test:
+  // b[0] = 42; b[1] = 26; b[2] = 47; b[3] = 7; b[4] = 27;
+  
+  // Read values from input arrays
   for (int i=0;i<5;++i) {
-    int slot = sl(i);
-    if (slot>=0 && slot<13 && b[slot] == -1) {
-      b[slot] = c5(i);
+    int slot_idx = static_cast<int>(sl(i));
+    int card_value = static_cast<int>(c5(i));
+    if (slot_idx>=0 && slot_idx<13) {
+      b[slot_idx] = static_cast<int16_t>(card_value);
     }
   }
   // Deal next 3 for round 1

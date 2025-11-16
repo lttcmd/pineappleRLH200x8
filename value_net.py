@@ -10,6 +10,7 @@ class ValueNet(nn.Module):
     """Neural network with two heads:
     - value_head: expected final score (regression)
     - foul_head: foul probability (classification via sigmoid on logits)
+    - feas_head: feasibility proxy (classification logit)
     """
     
     def __init__(self, input_dim: int, hidden_dim: int = 512):
@@ -29,6 +30,8 @@ class ValueNet(nn.Module):
         self.foul_head = nn.Linear(trunk_dim, 1)
         # Round-0 policy over 12 fixed candidate placements (logits)
         self.round0_head = nn.Linear(trunk_dim, 12)
+        # Feasibility proxy head
+        self.feas_head = nn.Linear(trunk_dim, 1)
     
     def forward(self, x: torch.Tensor):
         """
@@ -36,10 +39,12 @@ class ValueNet(nn.Module):
             value: (B,1)
             foul_logit: (B,1)
             round0_logits: (B,12)
+            feas_logit: (B,1)
         """
         h = self.trunk(x)
         value = self.value_head(h)
         foul_logit = self.foul_head(h)
         round0_logits = self.round0_head(h)
-        return value, foul_logit, round0_logits
+        feas_logit = self.feas_head(h)
+        return value, foul_logit, round0_logits, feas_logit
 

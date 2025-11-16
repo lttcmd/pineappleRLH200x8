@@ -7,6 +7,11 @@
 #include <cstdint>
 #include <unordered_map>
 
+// Windows compatibility: ssize_t is not available on MSVC, use Py_ssize_t instead
+#ifdef _WIN32
+typedef Py_ssize_t ssize_t;
+#endif
+
 namespace py = pybind11;
 
 // Reuse helpers
@@ -525,10 +530,13 @@ py::tuple generate_random_episodes(uint64_t seed, int num_episodes) {
     for (int i=0;i<3;++i) tr(i)=board[10+i];
     auto sc = score_board_from_ints(bottom, middle, top);
     final_scores.push_back(sc.first);
+    // Push the current state_count as the end offset for this episode
+    // This should be cumulative: [0, 5, 10, 15, ...] for episodes with 5 states each
     offsets.push_back(state_count);
   }
-
+  
   // Build numpy arrays
+  // Offsets are already correctly built as cumulative values during the episode loop
   ssize_t S = boards_all.size() / 13;
   py::array_t<int16_t> boards_np({S, (ssize_t)13});
   py::array_t<int8_t> rounds_np({S});
@@ -548,9 +556,12 @@ py::tuple generate_random_episodes(uint64_t seed, int num_episodes) {
     }
   }
   py::array_t<float> encoded = encode_state_batch_ints(boards_np, rounds_np, draws_np, deck_np);
+  // Create offsets array - ensure we copy values correctly
   py::array_t<int32_t> offs({(ssize_t)offsets.size()});
   auto O = offs.mutable_unchecked<1>();
-  for (ssize_t i=0;i<(ssize_t)offsets.size();++i) O(i)=offsets[i];
+  for (ssize_t i=0;i<(ssize_t)offsets.size();++i) {
+    O(i) = static_cast<int32_t>(offsets[i]);
+  }
   py::array_t<float> scores({(ssize_t)final_scores.size()});
   auto Sarr = scores.mutable_unchecked<1>();
   for (ssize_t i=0;i<(ssize_t)final_scores.size();++i) Sarr(i)=final_scores[i];
