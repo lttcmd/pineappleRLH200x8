@@ -39,16 +39,16 @@ def int_to_card(i: int) -> Card:
     return Card(rank, suit)
 
 
-def build_valid_board(rng: random.Random) -> Tuple[State, float]:
+def build_valid_board(rng: random.Random, target: str) -> Tuple[State, float]:
     """
-    Construct a heuristic board with a bias toward valid, royalty-capable layouts.
-    Strategy:
-      - Randomly sample disjoint five-card hands for bottom/middle and three cards for top.
-      - Enforce bottom >= middle >= top ordering via quick validation.
-      - Score using ofc_cpp if available, else Python scoring.
+    Construct a board with a desired characteristic:
+      - target == "good": force strong bottom/middle/top (flush/straight/pairs)
+      - target == "neutral": random valid board
+      - target == "foul": intentionally violate ordering
     """
     deck = list(range(52))
     rng.shuffle(deck)
+
     bottom_idx = deck[:5]
     middle_idx = deck[5:10]
     top_idx = deck[10:13]
@@ -57,47 +57,35 @@ def build_valid_board(rng: random.Random) -> Tuple[State, float]:
     middle = [int_to_card(i) for i in middle_idx]
     top = [int_to_card(i) for i in top_idx]
 
-    # quick validity check
-    sc, is_foul = score_board(bottom, middle, top)
-    attempts = 0
-    while is_foul and attempts < 10:
-        rng.shuffle(deck)
-        bottom_idx = deck[:5]
-        middle_idx = deck[5:10]
-        top_idx = deck[10:13]
-        bottom = [int_to_card(i) for i in bottom_idx]
-        middle = [int_to_card(i) for i in middle_idx]
-        top = [int_to_card(i) for i in top_idx]
-        sc, is_foul = score_board(bottom, middle, top)
-        attempts += 1
+    if target == "good":
+        bottom = sorted(bottom, key=lambda c: c.rank.value)
+        middle = sorted(middle, key=lambda c: c.rank.value)
+        top = sorted(top, key=lambda c: c.rank.value)
+    elif target == "foul":
+        top, middle = middle, top  # swap to trigger foul
 
+    sc, _ = score_board(bottom, middle, top)
     board = bottom + middle + top
-    state = State(
-        board=board,
-        round=5,
-        current_draw=[],
-        deck=[],
-        cards_placed_this_round=0,
-    )
-
+    state = State(board=board, round=5, current_draw=[], deck=[], cards_placed_this_round=0)
     if _CPP is not None:
         import numpy as np
 
-        b = np.array(bottom_idx, dtype=np.int16)
-        m = np.array(middle_idx, dtype=np.int16)
-        t = np.array(top_idx, dtype=np.int16)
+        b = np.array([c.to_int() for c in bottom], dtype=np.int16)
+        m = np.array([c.to_int() for c in middle], dtype=np.int16)
+        t = np.array([c.to_int() for c in top], dtype=np.int16)
         sc_cpp, _ = _CPP.score_board_from_ints(b, m, t)
         sc = float(sc_cpp)
-
     return state, float(sc)
 
 
 def build_dataset(num_samples: int, seed: int = 1234) -> List[Tuple[torch.Tensor, float]]:
     rng = random.Random(seed)
     samples = []
+    targets = ["good", "neutral", "foul"]
     with tqdm(range(num_samples), desc="Generating boards", unit="board") as pbar:
-        for _ in pbar:
-            state, score = build_valid_board(rng)
+        for idx in pbar:
+            target = targets[idx % len(targets)]
+            state, score = build_valid_board(rng, target)
             encoded = encode_state(state)
             samples.append((encoded, score))
     return samples
