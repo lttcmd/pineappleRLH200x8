@@ -49,7 +49,7 @@ class ValueNetPolicy(Policy):
 
     def __init__(self, checkpoint_path: str, penalty: float = 10.0, device: Optional[str] = None):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        self.model = ValueNet(get_input_dim(), hidden_dim=512)
+        self.model = ValueNet(get_input_dim(), hidden_dim=512).to(self.device)
         state_dict = torch.load(checkpoint_path, map_location=self.device)
         self.model.load_state_dict(state_dict)
         self.model.eval()
