@@ -62,7 +62,8 @@ def build_valid_board(rng: random.Random, target: str) -> Tuple[State, float]:
         middle = sorted(middle, key=lambda c: c.rank.value)
         top = sorted(top, key=lambda c: c.rank.value)
     elif target == "foul":
-        top, middle = middle, top  # swap to trigger foul
+        # force foul by putting strong cards on top and weak cards on bottom
+        bottom, top = top + bottom[:2], bottom[:3]
 
     sc, _ = score_board(bottom, middle, top)
     board = bottom + middle + top
