@@ -204,7 +204,7 @@ class SelfPlayTrainer:
             seed = int(time.time() * 1000000) + env_idx  # Unique seed
             encoded, offsets, scores_np = _CPP.generate_random_episodes(np.uint64(seed), 1)
             encoded_np = np.array(encoded, copy=False)
-            offsets_np = np.array(offsets, copy=False).astype(np.int32, copy=False)
+            offsets_np = np.array(offsets, dtype=np.int32)
             scores_np = np.array(scores_np, copy=False).astype(np.float32, copy=False)
             if scores_np.shape[0] > 0:
                 score = float(scores_np[0])
@@ -764,8 +764,8 @@ class SelfPlayTrainer:
                     encoded, offsets, scores_np = _CPP.generate_random_episodes(np.uint64(seed), int(batch_size_current))
                     # Numpy arrays
                     encoded_np = np.array(encoded, copy=False)            # [S,838] float32
-                    offsets_np = np.array(offsets, copy=False).astype(np.int32, copy=False)  # [E+1]
-                    scores_np = np.array(scores_np, copy=False).astype(np.float32, copy=False)  # [E]
+                    offsets_np = np.array(offsets, dtype=np.int32)  # [E+1]
+                    scores_np = np.array(scores_np, dtype=np.float32)  # [E]
                     # Update statistics and buffer
                     self.add_encoded_to_buffer(encoded_np, offsets_np, scores_np)
                     episodes_generated = scores_np.shape[0]
