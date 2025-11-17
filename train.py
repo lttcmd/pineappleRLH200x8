@@ -571,16 +571,16 @@ class SelfPlayTrainer:
     
     def _collect_random_batch(self, batch_size: int, seed: int) -> Tuple[int, List[float]]:
         if _USE_CPP and _CPP is not None:
-        if self.parallel_random_gen is not None:
-            encoded_np, offsets_np, scores_np = self.parallel_random_gen.generate_random(int(batch_size), int(seed))
-        else:
-            encoded, offsets, scores_np = _CPP.generate_random_episodes(np.uint64(seed), int(batch_size))
-            encoded_np = np.asarray(encoded, dtype=np.float32)
-            offsets_np = np.asarray(offsets, dtype=np.int32)
-            scores_np = np.asarray(scores_np, dtype=np.float32)
-        if scores_np.size == 0:
-            return 0, []
-        self.add_encoded_to_buffer(encoded_np, offsets_np, scores_np, is_random=True)
+            if self.parallel_random_gen is not None:
+                encoded_np, offsets_np, scores_np = self.parallel_random_gen.generate_random(int(batch_size), int(seed))
+            else:
+                encoded, offsets, scores_np = _CPP.generate_random_episodes(np.uint64(seed), int(batch_size))
+                encoded_np = np.asarray(encoded, dtype=np.float32)
+                offsets_np = np.asarray(offsets, dtype=np.int32)
+                scores_np = np.asarray(scores_np, dtype=np.float32)
+            if scores_np.size == 0:
+                return 0, []
+            self.add_encoded_to_buffer(encoded_np, offsets_np, scores_np, is_random=True)
             return scores_np.shape[0], scores_np.tolist()
         episode_data = self.generate_episodes_parallel(batch_size, use_random=True, base_seed=seed)
         scores = self._ingest_python_episode_data(episode_data, is_random=True)
