@@ -60,8 +60,7 @@ def evaluate_model_performance(trainer: SelfPlayTrainer, num_episodes: int = 50,
         # For model-guided, we need unique episode scores
         if use_model:
             # Group by episode (approximate - assume episodes have similar lengths)
-            # Actually, for model-guided, we should use generate_episodes_parallel_with_server
-            # But for simplicity, let's just use the scores we have
+            # Engine-assisted collection would provide cleaner episode boundaries.
             pass
     
     if len(scores_np) == 0:

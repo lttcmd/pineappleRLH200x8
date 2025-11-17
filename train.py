@@ -15,6 +15,7 @@ import time
 import os
 import glob
 import re
+import math
 import multiprocessing as mp
 
 # Try optional C++ backend
@@ -26,11 +27,88 @@ except Exception:
     _USE_CPP = False
 
 from ofc_env import State, Action, OfcEnv
-# Note: OfcEnv import removed - training uses C++ workers exclusively
-# OfcEnv is only used in demo.py for interactive play
 from state_encoding import encode_state, encode_state_batch, get_input_dim
 from value_net import ValueNet
 from action_selection import choose_best_action_beam_search
+
+
+def _random_episode_worker(task):
+    seed, num_episodes = task
+    encoded, offsets, scores = _CPP.generate_random_episodes(np.uint64(seed), int(num_episodes))
+    encoded_np = np.array(encoded, copy=False)
+    offsets_np = np.array(offsets, dtype=np.int32, copy=False)
+    scores_np = np.array(scores, dtype=np.float32, copy=False)
+    return encoded_np, offsets_np, scores_np
+
+
+def _merge_episode_chunks(chunks):
+    if not chunks:
+        return (
+            np.empty((0, 838), dtype=np.float32),
+            np.zeros(1, dtype=np.int32),
+            np.empty((0,), dtype=np.float32),
+        )
+    encoded_parts = []
+    scores_parts = []
+    offsets_list = [0]
+    state_offset = 0
+    for enc_np, offs_np, scores_np in chunks:
+        if enc_np.size == 0 or offs_np.size == 0:
+            continue
+        encoded_parts.append(np.asarray(enc_np, dtype=np.float32))
+        scores_parts.append(np.asarray(scores_np, dtype=np.float32))
+        offs_arr = np.asarray(offs_np, dtype=np.int32)
+        shifted = offs_arr + state_offset
+        offsets_list.extend(shifted[1:].tolist())
+        state_offset = shifted[-1]
+    if not encoded_parts:
+        return (
+            np.empty((0, 838), dtype=np.float32),
+            np.zeros(1, dtype=np.int32),
+            np.empty((0,), dtype=np.float32),
+        )
+    encoded = np.concatenate(encoded_parts, axis=0)
+    scores = np.concatenate(scores_parts, axis=0)
+    offsets = np.array(offsets_list, dtype=np.int32)
+    return encoded, offsets, scores
+
+
+class ParallelEpisodeGenerator:
+    def __init__(self, num_workers: int):
+        self.num_workers = max(1, num_workers)
+        self.ctx = mp.get_context("spawn")
+        self.pool = None
+        if self.num_workers > 1:
+            self.pool = self.ctx.Pool(self.num_workers)
+
+    def close(self):
+        if self.pool is not None:
+            self.pool.close()
+            self.pool.join()
+            self.pool = None
+
+    def generate_random(self, total_episodes: int, base_seed: int):
+        if total_episodes <= 0:
+            return (
+                np.empty((0, 838), dtype=np.float32),
+                np.zeros(1, dtype=np.int32),
+                np.empty((0,), dtype=np.float32),
+            )
+        if self.pool is None or self.num_workers == 1:
+            return _random_episode_worker((base_seed, total_episodes))
+        chunk_size = math.ceil(total_episodes / self.num_workers)
+        tasks = []
+        generated = 0
+        for worker_idx in range(self.num_workers):
+            remaining = total_episodes - generated
+            if remaining <= 0:
+                break
+            episodes = min(chunk_size, remaining)
+            seed = base_seed + worker_idx * 131071 + generated
+            tasks.append((seed, episodes))
+            generated += episodes
+        chunks = self.pool.map(_random_episode_worker, tasks)
+        return _merge_episode_chunks(chunks)
 
 
 @dataclass
@@ -117,8 +195,17 @@ class SelfPlayTrainer:
         if num_workers is None:
             num_workers = max(1, mp.cpu_count())  # Used for engine configuration
         self.num_workers = num_workers
-        self.pool = None  # No longer used - C++ handles parallelism
+        self.pool = None  # Legacy placeholder
         print(f"C++ Workers: Engine will use up to {num_workers} parallel environments")
+        self.random_workers = max(1, min(num_workers, mp.cpu_count()))
+        self.parallel_random_gen = None
+        if _CPP is not None and self.random_workers > 1:
+            try:
+                self.parallel_random_gen = ParallelEpisodeGenerator(self.random_workers)
+                print(f"Parallel random generator using {self.random_workers} processes")
+            except Exception as exc:
+                print(f"Failed to start parallel generator ({exc}); falling back to single process")
+                self.parallel_random_gen = None
 
         # Configure default engine parameters
         self.engine_num_envs = max(64, min(256, self.num_workers))  # more envs
@@ -137,6 +224,10 @@ class SelfPlayTrainer:
         self.target_var_ema = 1.0
         self.target_ema_decay = 0.99
         self.target_ema_initialized = False
+        # Scheduler
+        self.scheduler_cursor = 0
+        self.scheduler_period = 16
+        self.checkpoint_history: List[int] = []
     
     def _foul_penalty_for_episode(self, absolute_episode: int) -> float:
         """
@@ -407,13 +498,28 @@ class SelfPlayTrainer:
             t = (absolute_episode - self.random_phase_episodes) / max(1, self.anneal_phase_episodes)
             return 1.0 - t * (1.0 - self.min_random_prob)
         return self.min_random_prob
+
+    def _select_batch_mode(self, absolute_episode: int) -> bool:
+        random_prob = self._random_probability(absolute_episode)
+        if random_prob >= 0.999:
+            return True
+        if random_prob <= 0.001:
+            return False
+        slots = max(2, self.scheduler_period)
+        random_slots = max(1, int(round(slots * random_prob)))
+        slot = self.scheduler_cursor % slots
+        self.scheduler_cursor += 1
+        return slot < random_slots
     
     def _collect_random_batch(self, batch_size: int, seed: int) -> Tuple[int, List[float]]:
         if _USE_CPP and _CPP is not None:
-            encoded, offsets, scores_np = _CPP.generate_random_episodes(np.uint64(seed), int(batch_size))
-            encoded_np = np.array(encoded, copy=False)
-            offsets_np = np.array(offsets, dtype=np.int32)
-            scores_np = np.array(scores_np, dtype=np.float32)
+            if self.parallel_random_gen is not None:
+                encoded_np, offsets_np, scores_np = self.parallel_random_gen.generate_random(int(batch_size), int(seed))
+            else:
+                encoded, offsets, scores_np = _CPP.generate_random_episodes(np.uint64(seed), int(batch_size))
+                encoded_np = np.array(encoded, copy=False)
+                offsets_np = np.array(offsets, dtype=np.int32, copy=False)
+                scores_np = np.array(scores_np, dtype=np.float32, copy=False)
             if scores_np.size == 0:
                 return 0, []
             self.add_encoded_to_buffer(encoded_np, offsets_np, scores_np)
@@ -472,6 +578,7 @@ class SelfPlayTrainer:
         print(f"{'='*60}\n")
         if avg_loss is not None:
             print(f"Average training loss: {avg_loss:.4f}")
+        self.checkpoint_history.append(episode)
         training_foul_rate = stats.foul_rate
         avg_score_per_hand = stats.avg_score
         self._evaluate(
@@ -672,18 +779,15 @@ class SelfPlayTrainer:
         """
         Train the model using self-play through millions of hands.
         The bot learns what good and bad choices are via RL.
-        
-        Args:
-            num_episodes: Total number of episodes (hands) to generate
-            episodes_per_update: How many episodes to collect before updating
-            eval_frequency: How often to evaluate (in episodes)
         """
         start_time = time.time()
-        losses: List[float] = []
         stats = TrainingStats()
         start_episode = 0
         checkpoint_loaded = None
         original_target = num_episodes
+        updates_per_cycle = 1024
+        self.max_updates_per_batch = max(16, updates_per_cycle // 8)
+        losses_history: List[float] = []
         
         if resume:
             checkpoint_info = self.find_latest_checkpoint()
@@ -719,46 +823,78 @@ class SelfPlayTrainer:
         )
         
         episodes_per_batch = max(self.num_workers, episodes_per_update, 32)
-        processed_checkpoints = set()
         current_episode = start_episode
-        updates_per_cycle = 1024
+        update_budget = 0.0
+        total_updates_run = 0
+        throughput_ema = None
+        next_checkpoint = None
+        if eval_frequency > 0:
+            next_checkpoint = eval_frequency
+            while next_checkpoint <= start_episode:
+                next_checkpoint += eval_frequency
         
         while current_episode < num_episodes:
             remaining = num_episodes - current_episode
             batch_size_current = min(episodes_per_batch, remaining)
-            use_random = np.random.rand() < self._random_probability(current_episode)
+            use_random = self._select_batch_mode(current_episode)
             seed = int(current_episode * 1000)
+            batch_start = time.time()
             
             if use_random:
                 generated, batch_scores = self._collect_random_batch(batch_size_current, seed)
             else:
                 generated, batch_scores = self._collect_model_batch(batch_size_current, seed)
             
-            generated = min(generated, batch_size_current, len(batch_scores))
-            if generated == 0:
+            if generated <= 0:
                 continue
             
             stats.observe_many(batch_scores[:generated])
             current_episode += generated
             pbar.update(generated)
-            pbar.set_postfix_str("random" if use_random else "model")
             
-            if (eval_frequency > 0 and current_episode % eval_frequency == 0 and
-                    current_episode not in processed_checkpoints):
-                new_losses = self._train_cycle(updates_per_cycle)
-                losses.extend(new_losses)
-                avg_loss = float(np.mean(new_losses)) if new_losses else None
-                self._run_checkpoint(current_episode, stats, avg_loss)
-                processed_checkpoints.add(current_episode)
+            batch_elapsed = max(1e-6, time.time() - batch_start)
+            hands_per_sec = generated / batch_elapsed
+            if throughput_ema is None:
+                throughput_ema = hands_per_sec
+            else:
+                throughput_ema = 0.9 * throughput_ema + 0.1 * hands_per_sec
+            pbar.set_postfix({
+                "mode": "rand" if use_random else "model",
+                "h/s": f"{hands_per_sec:6.1f}",
+                "avg": f"{throughput_ema:6.1f}",
+                "upd": total_updates_run
+            })
+            
+            if eval_frequency > 0:
+                update_budget += (generated / eval_frequency) * updates_per_cycle
+            else:
+                update_budget += generated / max(1, episodes_per_batch) * self.max_updates_per_batch
+            
+            updates_ready = int(update_budget)
+            if updates_ready > 0 and len(self.replay_buffer) >= self.batch_size:
+                updates_to_run = min(updates_ready, self.max_updates_per_batch)
+                losses = self._train_cycle(updates_to_run)
+                total_updates_run += updates_to_run
+                update_budget -= updates_to_run
+                if losses:
+                    losses_history.extend(losses)
+            
+            if eval_frequency > 0 and next_checkpoint is not None:
+                while next_checkpoint <= num_episodes and current_episode >= next_checkpoint:
+                    if len(self.replay_buffer) >= self.batch_size and update_budget > 0:
+                        extra_updates = max(int(math.ceil(update_budget)), self.max_updates_per_batch)
+                        losses = self._train_cycle(extra_updates)
+                        total_updates_run += extra_updates
+                        update_budget = 0.0
+                        if losses:
+                            losses_history.extend(losses)
+                    recent_loss = float(np.mean(
+                        losses_history[-self.max_updates_per_batch:]
+                    )) if losses_history else None
+                    self._run_checkpoint(next_checkpoint, stats, recent_loss)
+                    next_checkpoint += eval_frequency
         
         pbar.close()
-        
-        if (eval_frequency > 0 and num_episodes % eval_frequency == 0 and
-                num_episodes not in processed_checkpoints):
-            new_losses = self._train_cycle(updates_per_cycle)
-            losses.extend(new_losses)
-            avg_loss = float(np.mean(new_losses)) if new_losses else None
-            self._run_checkpoint(num_episodes, stats, avg_loss)
         
         elapsed = time.time() - start_time
         print(f"\n{'='*60}")
@@ -948,10 +1084,9 @@ class SelfPlayTrainer:
     
     def cleanup(self):
         """Cleanup resources."""
-        # C++ engine handles its own cleanup, no Python multiprocessing pool to clean
-        if hasattr(self, 'pool') and self.pool is not None:
-            self.pool.close()
-            self.pool.join()
+        if self.parallel_random_gen is not None:
+            self.parallel_random_gen.close()
+            self.parallel_random_gen = None
 
 
 def main():
