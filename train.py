@@ -1109,13 +1109,13 @@ class SelfPlayTrainer:
             for eval_idx in eval_pbar:
                 # For evaluation, use Python path to ensure reliable single-episode generation
                 # This is more reliable than the C++ engine for single episodes
-                # Force Python path by temporarily disabling C++
-                import os
-                old_cpp_env = os.environ.get('OFC_USE_CPP', '1')
-                os.environ['OFC_USE_CPP'] = '0'  # Force Python path
-                from ofc_env import OfcEnv
+                # Force Python path by temporarily disabling C++ in the module
+                from ofc_env import OfcEnv, _CPP as _CPP_ORIG
+                import ofc_env
+                old_cpp = ofc_env._CPP
+                ofc_env._CPP = None  # Force Python path
                 env = OfcEnv()
-                os.environ['OFC_USE_CPP'] = old_cpp_env  # Restore
+                ofc_env._CPP = old_cpp  # Restore
                 state = env.reset()
                 
                 # Verify reset worked correctly
