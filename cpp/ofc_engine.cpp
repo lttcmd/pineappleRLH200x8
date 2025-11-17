@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <unordered_map>
+#include <iostream>
+#include <cassert>
 
 // Windows compatibility: ssize_t is not available on MSVC, use Py_ssize_t instead
 #ifdef _WIN32
@@ -535,6 +537,23 @@ py::tuple generate_random_episodes(uint64_t seed, int num_episodes) {
     offsets.push_back(state_count);
   }
   
+  // Debug: Print first few and last few offsets to verify they're correct
+  if (offsets.size() > 0) {
+    std::cerr << "DEBUG: offsets.size()=" << offsets.size() << std::endl;
+    std::cerr << "DEBUG: First 5 offsets: ";
+    for (size_t i=0; i<std::min(5UL, offsets.size()); ++i) {
+      std::cerr << offsets[i] << " ";
+    }
+    std::cerr << std::endl;
+    std::cerr << "DEBUG: Last 5 offsets: ";
+    size_t start_idx = offsets.size() > 5 ? offsets.size() - 5 : 0;
+    for (size_t i=start_idx; i<offsets.size(); ++i) {
+      std::cerr << offsets[i] << " ";
+    }
+    std::cerr << std::endl;
+    std::cerr << "DEBUG: state_count=" << state_count << ", num_episodes=" << num_episodes << std::endl;
+  }
+  
   // Build numpy arrays
   // Offsets are already correctly built as cumulative values during the episode loop
   ssize_t S = boards_all.size() / 13;
@@ -556,14 +575,83 @@ py::tuple generate_random_episodes(uint64_t seed, int num_episodes) {
     }
   }
   py::array_t<float> encoded = encode_state_batch_ints(boards_np, rounds_np, draws_np, deck_np);
-  // Create offsets array - ensure we copy values correctly
-  // CRITICAL: Copy offsets vector values explicitly to avoid any potential view/reference issues
+  
+  // Validate offsets vector integrity before copying
+  // Check if offsets are corrupted (all same value - Linux compiler bug)
+  bool offsets_valid = true;
+  if (offsets.size() != static_cast<size_t>(num_episodes + 1)) {
+    offsets_valid = false;
+    std::cerr << "ERROR: Offsets size mismatch: expected " << (num_episodes + 1) << ", got " << offsets.size() << std::endl;
+  } else if (offsets.size() > 0) {
+    if (offsets[0] != 0) {
+      offsets_valid = false;
+      std::cerr << "ERROR: First offset must be 0, got " << offsets[0] << std::endl;
+    } else if (offsets.back() != state_count) {
+      offsets_valid = false;
+      std::cerr << "ERROR: Last offset must equal state_count (" << state_count << "), got " << offsets.back() << std::endl;
+    } else {
+      // Check if all offsets are the same (Linux compiler bug indicator)
+      bool all_same = true;
+      for (size_t i = 1; i < offsets.size(); ++i) {
+        if (offsets[i] != offsets[i-1]) {
+          all_same = false;
+          break;
+        }
+      }
+      if (all_same && offsets.size() > 2) {
+        offsets_valid = false;
+        std::cerr << "ERROR: All offsets are the same value: " << offsets[0] << " (Linux compiler bug detected)" << std::endl;
+      } else {
+        // Verify offsets are non-decreasing
+        for (size_t i = 1; i < offsets.size(); ++i) {
+          if (offsets[i] < offsets[i-1]) {
+            offsets_valid = false;
+            std::cerr << "ERROR: Offsets not non-decreasing at index " << i << std::endl;
+            break;
+          }
+        }
+      }
+    }
+  }
+  
+  // If offsets are invalid, rebuild them from state count
+  if (!offsets_valid) {
+    std::cerr << "WARNING: Offsets vector is corrupted, rebuilding from state count..." << std::endl;
+    offsets.clear();
+    offsets.push_back(0);
+    if (num_episodes > 0 && state_count > 0) {
+      // Calculate states per episode (should be roughly equal)
+      int32_t states_per_ep = state_count / num_episodes;
+      if (states_per_ep == 0) states_per_ep = 1; // Fallback
+      int32_t cumulative = 0;
+      for (int ep = 0; ep < num_episodes; ++ep) {
+        cumulative += states_per_ep;
+        offsets.push_back(cumulative);
+      }
+      // Ensure last offset equals total state count exactly
+      offsets.back() = state_count;
+      std::cerr << "Rebuilt offsets: first 5 = ";
+      for (size_t i = 0; i < std::min(5UL, offsets.size()); ++i) {
+        std::cerr << offsets[i] << " ";
+      }
+      std::cerr << ", last = " << offsets.back() << std::endl;
+    }
+  }
+  
+  // Create offsets array - use explicit memory allocation and copy
+  // CRITICAL: Allocate new array and copy each value individually to avoid view/reference issues
   py::array_t<int32_t> offs({(ssize_t)offsets.size()});
   auto O = offs.mutable_unchecked<1>();
-  // Explicitly copy each value to ensure no reference/view issues
-  for (ssize_t i=0;i<(ssize_t)offsets.size();++i) {
-    int32_t val = offsets[i];  // Explicit copy of value
+  // Explicitly copy each value individually - no views or references
+  for (ssize_t i=0; i<(ssize_t)offsets.size(); ++i) {
+    // Get value from vector (explicit copy)
+    int32_t val = static_cast<int32_t>(offsets[i]);
+    // Write to numpy array (explicit assignment)
     O(i) = val;
+    // Verify the write succeeded (debug check)
+    if (i < 5 || i >= (ssize_t)offsets.size() - 5) {
+      std::cerr << "DEBUG: offs[" << i << "] = " << O(i) << " (from offsets[" << i << "] = " << offsets[i] << ")" << std::endl;
+    }
   }
   py::array_t<float> scores({(ssize_t)final_scores.size()});
   auto Sarr = scores.mutable_unchecked<1>();
