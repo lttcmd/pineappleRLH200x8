@@ -639,31 +639,37 @@ py::tuple generate_random_episodes(uint64_t seed, int num_episodes) {
     }
   }
   
-  // Create offsets array - CRITICAL: Copy to temporary vector first, then to array
-  // This ensures we have a stable copy before creating the numpy array
+  // Create offsets array - CRITICAL: Use raw pointer access to avoid mutable_unchecked bug
+  // The mutable_unchecked accessor seems to have a bug on Linux where all writes go to same location
   ssize_t offs_size = (ssize_t)offsets.size();
   std::vector<int32_t> offsets_stable(offs_size);
   for (size_t i=0; i<offsets.size(); ++i) {
     offsets_stable[i] = static_cast<int32_t>(offsets[i]);
   }
   
-  // Now create array and copy from stable vector
+  // Create array and get raw pointer to data
   py::array_t<int32_t> offs({offs_size});
-  auto O = offs.mutable_unchecked<1>();
-  // Copy element by element to ensure each value is written
-  for (ssize_t i=0; i<offs_size; ++i) {
-    O(i) = offsets_stable[i];
-  }
+  py::buffer_info buf = offs.request();
+  int32_t* offs_ptr = static_cast<int32_t*>(buf.ptr);
   
-  // Verify immediately after copy
-  std::cerr << "DEBUG: After copying from stable vector, verifying array:" << std::endl;
+  // Copy using raw pointer - this should avoid the mutable_unchecked bug
+  std::memcpy(offs_ptr, offsets_stable.data(), offs_size * sizeof(int32_t));
+  
+  // Verify immediately after memcpy
+  std::cerr << "DEBUG: After memcpy to raw pointer, verifying array:" << std::endl;
   for (ssize_t i=0; i<std::min(5L, offs_size); ++i) {
-    int32_t val = O(i);
+    int32_t val = offs_ptr[i];
     std::cerr << "  offs[" << i << "] = " << val << " (expected " << offsets_stable[i] << ")" << std::endl;
+    if (val != offsets_stable[i]) {
+      std::cerr << "ERROR: Mismatch at index " << i << "!" << std::endl;
+    }
   }
   for (ssize_t i=std::max(0L, offs_size-5); i<offs_size; ++i) {
-    int32_t val = O(i);
+    int32_t val = offs_ptr[i];
     std::cerr << "  offs[" << i << "] = " << val << " (expected " << offsets_stable[i] << ")" << std::endl;
+    if (val != offsets_stable[i]) {
+      std::cerr << "ERROR: Mismatch at index " << i << "!" << std::endl;
+    }
   }
   py::array_t<float> scores({(ssize_t)final_scores.size()});
   auto Sarr = scores.mutable_unchecked<1>();
