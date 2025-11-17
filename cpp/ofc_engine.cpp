@@ -639,31 +639,25 @@ py::tuple generate_random_episodes(uint64_t seed, int num_episodes) {
     }
   }
   
-  // Create offsets array - use the same pattern as engine_collect_encoded_episodes
-  // This pattern works on both Windows and Linux (proven in engine_collect_encoded_episodes)
-  auto offs = py::array_t<int32_t>({(ssize_t)offsets.size()});
-  {
-    auto O = offs.mutable_unchecked<1>();
-    // Copy element by element, verifying each write
-    for (ssize_t i=0; i<(ssize_t)offsets.size(); ++i) {
-      int32_t val = static_cast<int32_t>(offsets[i]);
-      O(i) = val;
-      // Verify the write immediately (debug for Linux bug)
-      if (i < 5 || i >= (ssize_t)offsets.size() - 5) {
-        int32_t read_back = O(i);
-        if (read_back != val) {
-          std::cerr << "ERROR: Write failed at index " << i << ": wrote " << val << " but read " << read_back << std::endl;
-        }
-      }
-    }
-    // Final verification
-    std::cerr << "DEBUG: After mutable_unchecked copy, verifying:" << std::endl;
-    for (ssize_t i=0; i<std::min(5L, (ssize_t)offsets.size()); ++i) {
-      std::cerr << "  offs[" << i << "] = " << O(i) << " (expected " << offsets[i] << ")" << std::endl;
-    }
-    for (ssize_t i=std::max(0L, (ssize_t)offsets.size()-5); i<(ssize_t)offsets.size(); ++i) {
-      std::cerr << "  offs[" << i << "] = " << O(i) << " (expected " << offsets[i] << ")" << std::endl;
-    }
+  // Create offsets array - CRITICAL FIX for Linux
+  // mutable_unchecked has a bug on Linux where all writes go to same location
+  // Use py::cast to create array from vector, which handles copy properly
+  std::vector<int32_t> offsets_int32(offsets.size());
+  for (size_t i=0; i<offsets.size(); ++i) {
+    offsets_int32[i] = static_cast<int32_t>(offsets[i]);
+  }
+  
+  // py::cast creates a proper copy with ownership
+  py::array_t<int32_t> offs = py::cast(offsets_int32);
+  
+  // Verify the array contents
+  auto O_verify = offs.unchecked<1>();
+  std::cerr << "DEBUG: After py::cast from vector, verifying:" << std::endl;
+  for (ssize_t i=0; i<std::min(5L, (ssize_t)offsets.size()); ++i) {
+    std::cerr << "  offs[" << i << "] = " << O_verify(i) << " (expected " << offsets[i] << ")" << std::endl;
+  }
+  for (ssize_t i=std::max(0L, (ssize_t)offsets.size()-5); i<(ssize_t)offsets.size(); ++i) {
+    std::cerr << "  offs[" << i << "] = " << O_verify(i) << " (expected " << offsets[i] << ")" << std::endl;
   }
   py::array_t<float> scores({(ssize_t)final_scores.size()});
   auto Sarr = scores.mutable_unchecked<1>();
