@@ -1143,20 +1143,17 @@ class SelfPlayTrainer:
                         episode_states.append(state)
                         break
                 
+                # Check if board was complete BEFORE scoring
+                # (score() returns 0.0 for incomplete boards, so we need to check first)
+                is_complete = all(slot is not None for slot in state.board)
                 final_score = env.score(state)
                 test_scores.append(final_score)
                 
-                # Check if board was complete
-                if final_score == 0.0:
-                    # Could be incomplete or complete with no royalties
-                    # Check actual board state
-                    is_complete = all(slot is not None for slot in state.board)
-                    if is_complete:
-                        complete_boards += 1
-                    else:
-                        incomplete_boards += 1
-                else:
+                # Track completion status
+                if is_complete:
                     complete_boards += 1
+                else:
+                    incomplete_boards += 1
                 
                 if final_score < 0:  # Foul penalty
                     test_fouls += 1
