@@ -1146,11 +1146,17 @@ class SelfPlayTrainer:
                     # Safety check: if board is complete, mark as done
                     if all(slot is not None for slot in state.board):
                         # Board is complete, force done
+                        done = True
                         break
                 
                 # Check if board was complete BEFORE scoring
                 # (score() returns 0.0 for incomplete boards, so we need to check first)
                 is_complete = all(slot is not None for slot in state.board)
+                
+                # Debug: Print completion status for first few episodes
+                if eval_idx < 5:
+                    filled_slots = sum(1 for slot in state.board if slot is not None)
+                    print(f"  Eval {eval_idx}: filled={filled_slots}/13, round={state.round}, done={done if 'done' in locals() else 'N/A'}")
                 final_score = env.score(state)
                 test_scores.append(final_score)
                 
