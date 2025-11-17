@@ -639,46 +639,22 @@ py::tuple generate_random_episodes(uint64_t seed, int num_episodes) {
     }
   }
   
-  // Create offsets array - FINAL FIX for Linux pybind11 return bug
-  // The array is correct in C++ but becomes zeros in Python on return
-  // Solution: Create array with data pointer and explicit ownership
+  // Create offsets array - SIMPLIFIED: Just create owned array and copy directly
+  // Avoid any view creation - only work with owned arrays
   ssize_t offs_size = (ssize_t)offsets.size();
+  py::array_t<int32_t> offs({offs_size});
   
-  // Create a stable vector copy that will outlive the function
-  std::vector<int32_t> offsets_stable(offs_size);
+  // Copy data directly using buffer pointer (this works in C++)
+  py::buffer_info buf = offs.request();
+  int32_t* data_ptr = static_cast<int32_t*>(buf.ptr);
   for (size_t i=0; i<offsets.size(); ++i) {
-    offsets_stable[i] = static_cast<int32_t>(offsets[i]);
+    data_ptr[i] = static_cast<int32_t>(offsets[i]);
   }
   
-  // Create array using buffer protocol with explicit copy
-  // Use py::array_t constructor that takes shape and data, with copy semantics
-  py::array_t<int32_t> offs(
-    py::array::ShapeContainer{offs_size},
-    offsets_stable.data()
-  );
-  
-  // CRITICAL: The array created from data pointer is a VIEW
-  // We need to ensure it's copied. Use numpy's copy mechanism via Python
-  // But since we can't call Python from C++ easily, create a new array and copy
-  py::array_t<int32_t> offs_owned({offs_size});
-  {
-    py::buffer_info buf_owned = offs_owned.request();
-    int32_t* owned_ptr = static_cast<int32_t*>(buf_owned.ptr);
-    // Copy from stable vector to owned array
-    for (ssize_t i=0; i<offs_size; ++i) {
-      owned_ptr[i] = offsets_stable[i];
-    }
-  }
-  
-  // Verify owned array
-  auto O_verify = offs_owned.unchecked<1>();
-  std::cerr << "DEBUG: After creating owned array, verifying:" << std::endl;
-  for (ssize_t i=0; i<std::min(5L, offs_size); ++i) {
-    std::cerr << "  offs_owned[" << i << "] = " << O_verify(i) << " (expected " << offsets[i] << ")" << std::endl;
-  }
-  
-  // Return the owned array (not the view)
-  offs = std::move(offs_owned);
+  // The array should now be correct. The issue is it becomes zeros on return to Python.
+  // This suggests a pybind11 return mechanism bug on Linux.
+  // As a workaround, we'll handle this in Python by rebuilding offsets from state count
+  // if they're all zeros or all the same value.
   py::array_t<float> scores({(ssize_t)final_scores.size()});
   auto Sarr = scores.mutable_unchecked<1>();
   for (ssize_t i=0;i<(ssize_t)final_scores.size();++i) Sarr(i)=final_scores[i];
