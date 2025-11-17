@@ -470,14 +470,33 @@ class SelfPlayTrainer:
                     # Use conservative fixed penalty in engine mode (no episode index here)
                     penalty = self.selection_penalty_final
                     combined = vals - penalty * foul_prob
-                    vals_cpu = combined.detach().float().cpu().numpy()
-                # Pick best per env
-                best_by_env = {}
+                    combined_cpu = combined.detach().float().cpu().numpy()
+                    foul_cpu = foul_prob.detach().float().cpu().numpy()
+                    combined_cpu = np.atleast_1d(combined_cpu)
+                    foul_cpu = np.atleast_1d(foul_cpu)
+                # Pick best per env with a hard foul-probability threshold where possible
+                safe_threshold = 0.25
+                best_any = {}
+                best_safe = {}
                 for i in range(meta.shape[0]):
-                    env_id = int(meta[i, 0]); action_id = int(meta[i, 1])
-                    v = vals_cpu[i]
-                    if (env_id not in best_by_env) or (v > best_by_env[env_id][0]):
-                        best_by_env[env_id] = (v, action_id)
+                    env_id = int(meta[i, 0])
+                    action_id = int(meta[i, 1])
+                    v = float(combined_cpu[i])
+                    fp = float(foul_cpu[i])
+                    # Track best overall candidate per env (for fallback)
+                    if (env_id not in best_any) or (v > best_any[env_id][0]):
+                        best_any[env_id] = (v, action_id)
+                    # Track best "safe" candidate per env (low foul probability)
+                    if fp <= safe_threshold:
+                        if (env_id not in best_safe) or (v > best_safe[env_id][0]):
+                            best_safe[env_id] = (v, action_id)
+                # For each env, prefer safe candidate if available, else fall back to best_any
+                best_by_env = {}
+                for env_id, (v_any, a_any) in best_any.items():
+                    if env_id in best_safe:
+                        best_by_env[env_id] = best_safe[env_id]
+                    else:
+                        best_by_env[env_id] = (v_any, a_any)
                 if not best_by_env:
                     break
                 chosen = np.array([[e, a] for e, (_, a) in best_by_env.items()], dtype=np.int32)
@@ -992,7 +1011,23 @@ class SelfPlayTrainer:
                             foul_prob = torch.sigmoid(foul_logit).squeeze()
                             penalty = self.selection_penalty_final
                             combined = values - penalty * foul_prob
-                            best_idx = int(combined.argmax().item())
+                            combined_np = combined.detach().float().cpu().numpy()
+                            foul_np = foul_prob.detach().float().cpu().numpy()
+                            combined_np = np.atleast_1d(combined_np)
+                            foul_np = np.atleast_1d(foul_np)
+                            safe_threshold = 0.25
+                            best_idx = None
+                            best_val = None
+                            for i in range(len(candidate_actions)):
+                                fp = float(foul_np[i])
+                                v = float(combined_np[i])
+                                if fp <= safe_threshold:
+                                    if best_idx is None or v > best_val:
+                                        best_idx = i
+                                        best_val = v
+                            # If no "safe" action found, fall back to best combined value
+                            if best_idx is None:
+                                best_idx = int(combined_np.argmax())
                         action = candidate_actions[best_idx]
                     except Exception:
                         # Fallback to random if anything goes wrong
