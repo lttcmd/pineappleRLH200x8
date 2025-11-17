@@ -538,22 +538,7 @@ py::tuple generate_random_episodes(uint64_t seed, int num_episodes) {
     offsets.push_back(state_count);
   }
   
-  // Debug: Print first few and last few offsets to verify they're correct
-  if (offsets.size() > 0) {
-    std::cerr << "DEBUG: offsets.size()=" << offsets.size() << std::endl;
-    std::cerr << "DEBUG: First 5 offsets: ";
-    for (size_t i=0; i<std::min(5UL, offsets.size()); ++i) {
-      std::cerr << offsets[i] << " ";
-    }
-    std::cerr << std::endl;
-    std::cerr << "DEBUG: Last 5 offsets: ";
-    size_t start_idx = offsets.size() > 5 ? offsets.size() - 5 : 0;
-    for (size_t i=start_idx; i<offsets.size(); ++i) {
-      std::cerr << offsets[i] << " ";
-    }
-    std::cerr << std::endl;
-    std::cerr << "DEBUG: state_count=" << state_count << ", num_episodes=" << num_episodes << std::endl;
-  }
+  // Debug output removed - offsets are working correctly now
   
   // Build numpy arrays
   // Offsets are already correctly built as cumulative values during the episode loop

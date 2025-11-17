@@ -1112,11 +1112,20 @@ class SelfPlayTrainer:
                 from ofc_env import OfcEnv
                 env = OfcEnv()
                 state = env.reset()
+                
+                # Verify reset worked correctly
+                if state.round != 0 or len(state.current_draw) != 5:
+                    # Reset failed, skip this episode
+                    test_scores.append(0.0)
+                    incomplete_boards += 1
+                    continue
+                
                 episode_states = []
                 max_steps = 50  # Increased from 30 to allow more steps for completion
                 step_count = 0
+                done = False
                 
-                while step_count < max_steps:
+                while step_count < max_steps and not done:
                     legal_actions = env.legal_actions(state)
                     if not legal_actions:
                         episode_states.append(state)
@@ -1152,11 +1161,6 @@ class SelfPlayTrainer:
                 # Check if board was complete BEFORE scoring
                 # (score() returns 0.0 for incomplete boards, so we need to check first)
                 is_complete = all(slot is not None for slot in state.board)
-                
-                # Debug: Print completion status for first few episodes
-                if eval_idx < 5:
-                    filled_slots = sum(1 for slot in state.board if slot is not None)
-                    print(f"  Eval {eval_idx}: filled={filled_slots}/13, round={state.round}, done={done if 'done' in locals() else 'N/A'}")
                 final_score = env.score(state)
                 test_scores.append(final_score)
                 
