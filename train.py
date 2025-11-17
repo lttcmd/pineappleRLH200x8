@@ -1139,6 +1139,11 @@ class SelfPlayTrainer:
                     episode_states.append(state)
                     step_count += 1
                     
+                    # Debug first few steps of first episode
+                    if eval_idx == 0 and step_count <= 3:
+                        filled_before = sum(1 for s in state.board if s is not None)
+                        print(f"    Step {step_count}: round={state.round}, filled={filled_before}/13, legal_actions={len(legal_actions)}")
+                    
                     # Use value network to choose action
                     from action_selection import choose_best_action_with_value_net
                     action = choose_best_action_with_value_net(
@@ -1152,7 +1157,20 @@ class SelfPlayTrainer:
                         # Fallback to random if model fails
                         action = legal_actions[random.randint(0, len(legal_actions) - 1)]
                     
+                    # Debug action chosen
+                    if eval_idx == 0 and step_count <= 3:
+                        if state.round == 0:
+                            print(f"      Action: round0, placements={len(action.placements)}")
+                        else:
+                            print(f"      Action: round{state.round}, keep={action.keep_indices}, placements={len(action.placements)}")
+                    
                     state, reward, done = env.step(state, action)
+                    
+                    # Debug after step
+                    if eval_idx == 0 and step_count <= 3:
+                        filled_after = sum(1 for s in state.board if s is not None)
+                        print(f"      After step: round={state.round}, filled={filled_after}/13, done={done}")
+                    
                     if done:
                         episode_states.append(state)
                         break
