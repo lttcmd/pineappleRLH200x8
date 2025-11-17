@@ -35,9 +35,10 @@ from action_selection import choose_best_action_beam_search
 def _random_episode_worker(task):
     seed, num_episodes = task
     encoded, offsets, scores = _CPP.generate_random_episodes(np.uint64(seed), int(num_episodes))
-    encoded_np = np.array(encoded, copy=False)
-    offsets_np = np.array(offsets, dtype=np.int32, copy=False)
-    scores_np = np.array(scores, dtype=np.float32, copy=False)
+    # Use asarray so NumPy 2.0 can safely copy when needed (e.g. when offsets is a Python list)
+    encoded_np = np.asarray(encoded, dtype=np.float32)
+    offsets_np = np.asarray(offsets, dtype=np.int32)
+    scores_np = np.asarray(scores, dtype=np.float32)
     return encoded_np, offsets_np, scores_np
 
 
@@ -260,9 +261,9 @@ class SelfPlayTrainer:
         if use_random and _USE_CPP and _CPP is not None:
             seed = int(time.time() * 1000000) + env_idx  # Unique seed
             encoded, offsets, scores_np = _CPP.generate_random_episodes(np.uint64(seed), 1)
-            encoded_np = np.array(encoded, copy=False)
-            offsets_np = np.array(offsets, dtype=np.int32)
-            scores_np = np.array(scores_np, copy=False).astype(np.float32, copy=False)
+            encoded_np = np.asarray(encoded, dtype=np.float32)
+            offsets_np = np.asarray(offsets, dtype=np.int32)
+            scores_np = np.asarray(scores_np, dtype=np.float32)
             if scores_np.shape[0] > 0:
                 score = float(scores_np[0])
                 s0 = int(offsets_np[0])
@@ -339,11 +340,11 @@ class SelfPlayTrainer:
         # For random episodes, use C++ generate_random_episodes (fast, parallel)
         if use_random and _USE_CPP and _CPP is not None:
             encoded, offsets, scores_np = _CPP.generate_random_episodes(np.uint64(base_seed), int(num_episodes))
-            encoded_np = np.array(encoded, copy=False)
+            encoded_np = np.asarray(encoded, dtype=np.float32)
             # Offsets are now returned as Python list to avoid pybind11 array bug on Linux
             # Convert list to numpy array (this is safe and works on both platforms)
-            offsets_np = np.array(offsets, dtype=np.int32)
-            scores_np = np.array(scores_np, copy=False).astype(np.float32, copy=False)
+            offsets_np = np.asarray(offsets, dtype=np.int32)
+            scores_np = np.asarray(scores_np, dtype=np.float32)
             
             # Convert to list of (state, score) tuples for compatibility
             # Note: states are pre-encoded, so we return encoded arrays
@@ -517,9 +518,9 @@ class SelfPlayTrainer:
                 encoded_np, offsets_np, scores_np = self.parallel_random_gen.generate_random(int(batch_size), int(seed))
             else:
                 encoded, offsets, scores_np = _CPP.generate_random_episodes(np.uint64(seed), int(batch_size))
-                encoded_np = np.array(encoded, copy=False)
-                offsets_np = np.array(offsets, dtype=np.int32, copy=False)
-                scores_np = np.array(scores_np, dtype=np.float32, copy=False)
+                encoded_np = np.asarray(encoded, dtype=np.float32)
+                offsets_np = np.asarray(offsets, dtype=np.int32)
+                scores_np = np.asarray(scores_np, dtype=np.float32)
             if scores_np.size == 0:
                 return 0, []
             self.add_encoded_to_buffer(encoded_np, offsets_np, scores_np)
