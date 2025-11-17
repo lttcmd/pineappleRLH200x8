@@ -412,11 +412,19 @@ def test_training_loop_integration():
             # Try direct C++ call to see what's happening
             try:
                 encoded, offsets, scores = _CPP.generate_random_episodes(np.uint64(42), 10)
-                print(f"  Direct C++ call: encoded.shape={encoded.shape}, offsets.shape={offsets.shape}, scores.shape={scores.shape}")
-                print(f"  Raw offsets (before conversion): {offsets}")
-                print(f"  Raw offsets type: {type(offsets)}")
-                if hasattr(offsets, '__array__'):
-                    print(f"  Raw offsets as array: {np.asarray(offsets)}")
+                # Offsets may be a list (new code) or array (old code)
+                offsets_type = type(offsets).__name__
+                if isinstance(offsets, (list, tuple)):
+                    offsets_shape = f"list({len(offsets)})"
+                    print(f"  Direct C++ call: encoded.shape={encoded.shape}, offsets={offsets_shape}, scores.shape={scores.shape}")
+                    print(f"  Raw offsets (Python list): {offsets[:11] if len(offsets) >= 11 else offsets}")
+                else:
+                    offsets_shape = offsets.shape if hasattr(offsets, 'shape') else 'unknown'
+                    print(f"  Direct C++ call: encoded.shape={encoded.shape}, offsets.shape={offsets_shape}, scores.shape={scores.shape}")
+                    print(f"  Raw offsets (before conversion): {offsets}")
+                    print(f"  Raw offsets type: {offsets_type}")
+                    if hasattr(offsets, '__array__'):
+                        print(f"  Raw offsets as array: {np.asarray(offsets)}")
                 if scores.shape[0] > 0:
                     print(f"  C++ returned {scores.shape[0]} episodes, but trainer returned empty list")
                     print(f"  This suggests an issue in generate_episodes_parallel processing")
