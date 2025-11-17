@@ -639,33 +639,14 @@ py::tuple generate_random_episodes(uint64_t seed, int num_episodes) {
     }
   }
   
-  // Create offsets array - ensure it owns its memory (not a view)
-  // On Linux, pybind11 may create views that get corrupted, so we need explicit ownership
-  ssize_t offs_size = (ssize_t)offsets.size();
-  
-  // Create a vector copy that will be used to create the array
-  // This ensures the data is stable and owned
-  std::vector<int32_t> offsets_copy(offs_size);
-  for (size_t i=0; i<offsets.size(); ++i) {
-    offsets_copy[i] = static_cast<int32_t>(offsets[i]);
-  }
-  
-  // CRITICAL: Create array that owns its memory (not a view)
-  // py::array_t with data pointer creates a view, so we create empty array and copy
-  py::array_t<int32_t> offs({offs_size});
-  py::buffer_info buf = offs.request();
-  int32_t* offs_data = static_cast<int32_t*>(buf.ptr);
-  
-  // Copy data using memcpy to ensure proper memory copy
-  std::memcpy(offs_data, offsets_copy.data(), offs_size * sizeof(int32_t));
-  
-  // Verify the copy worked
-  std::cerr << "DEBUG: After memcpy to owned array, verifying:" << std::endl;
-  for (ssize_t i=0; i<std::min(5L, offs_size); ++i) {
-    std::cerr << "  offs_data[" << i << "] = " << offs_data[i] << " (expected " << offsets_copy[i] << ")" << std::endl;
-  }
-  for (ssize_t i=std::max(0L, offs_size-5); i<offs_size; ++i) {
-    std::cerr << "  offs_data[" << i << "] = " << offs_data[i] << " (expected " << offsets_copy[i] << ")" << std::endl;
+  // Create offsets array - use the same pattern as engine_collect_encoded_episodes
+  // This pattern works on both Windows and Linux (proven in engine_collect_encoded_episodes)
+  auto offs = py::array_t<int32_t>({(ssize_t)offsets.size()});
+  {
+    auto O = offs.mutable_unchecked<1>();
+    for (ssize_t i=0; i<(ssize_t)offsets.size(); ++i) {
+      O(i) = static_cast<int32_t>(offsets[i]);
+    }
   }
   py::array_t<float> scores({(ssize_t)final_scores.size()});
   auto Sarr = scores.mutable_unchecked<1>();
