@@ -647,9 +647,26 @@ py::tuple generate_random_episodes(uint64_t seed, int num_episodes) {
   py::buffer_info buf = offs.request();
   int32_t* offs_data = static_cast<int32_t*>(buf.ptr);
   
+  // Verify buffer is valid
+  if (buf.ptr == nullptr) {
+    throw std::runtime_error("offsets array buffer pointer is null!");
+  }
+  if (buf.size != static_cast<size_t>(offs_size)) {
+    throw std::runtime_error("offsets array buffer size mismatch!");
+  }
+  
   // Copy data directly to array memory
   for (size_t i=0; i<offsets.size(); ++i) {
     offs_data[i] = static_cast<int32_t>(offsets[i]);
+  }
+  
+  // Verify the copy worked
+  std::cerr << "DEBUG: After copying to buffer, verifying:" << std::endl;
+  for (ssize_t i=0; i<std::min(5L, offs_size); ++i) {
+    std::cerr << "  offs_data[" << i << "] = " << offs_data[i] << " (expected " << offsets[i] << ")" << std::endl;
+  }
+  for (ssize_t i=std::max(0L, offs_size-5); i<offs_size; ++i) {
+    std::cerr << "  offs_data[" << i << "] = " << offs_data[i] << " (expected " << offsets[i] << ")" << std::endl;
   }
   py::array_t<float> scores({(ssize_t)final_scores.size()});
   auto Sarr = scores.mutable_unchecked<1>();
