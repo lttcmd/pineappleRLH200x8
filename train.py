@@ -178,11 +178,15 @@ class SelfPlayTrainer:
         
         self.buffer_size = buffer_size
         self.batch_size = batch_size
-        self.replay_buffer = deque(maxlen=buffer_size)
+        # Maintain separate buffers so random self-play doesn't drown out policy data.
+        self.random_buffer = deque(maxlen=buffer_size // 2)
+        self.policy_buffer = deque(maxlen=buffer_size // 2)
         
         self.optimizer = optim.Adam(model.parameters(), lr=learning_rate)
         self.criterion = nn.MSELoss()
         
+        # Control replay mix between random vs policy data
+        self.random_sample_frac = 0.4
         # C++ engine handles multiple environments internally
         # No need for Python OfcEnv objects in training
         self.num_envs = 64  # Used for C++ engine configuration
@@ -420,9 +424,9 @@ class SelfPlayTrainer:
     def add_to_buffer(self, episode_data: List[Tuple[State, float]]):
         """Add episode data to replay buffer."""
         for state, score in episode_data:
-            self.replay_buffer.append((state, score))
+            self.policy_buffer.append((state, score))
 
-    def add_encoded_to_buffer(self, encoded_states: np.ndarray, episode_offsets: np.ndarray, final_scores: np.ndarray):
+    def add_encoded_to_buffer(self, encoded_states: np.ndarray, episode_offsets: np.ndarray, final_scores: np.ndarray, is_random: bool):
         """
         Add pre-encoded states to replay buffer. Each state's target is the episode's final score.
         encoded_states: float32 [S, 838]
@@ -435,13 +439,47 @@ class SelfPlayTrainer:
         if episode_offsets.ndim != 1 or final_scores.ndim != 1 or episode_offsets.shape[0] != final_scores.shape[0] + 1:
             raise ValueError("episode_offsets must be [E+1] and final_scores [E] with matching sizes")
         # Append each state's encoded vector with its episode score
+        target_buffer = self.random_buffer if is_random else self.policy_buffer
         for e in range(final_scores.shape[0]):
             s0 = int(episode_offsets[e])
             s1 = int(episode_offsets[e+1])
             score = float(final_scores[e])
             # Slice view; store per-state rows
             for s in range(s0, s1):
-                self.replay_buffer.append((encoded_states[s], score))
+                target_buffer.append((encoded_states[s], score))
+
+    def _compute_sampling_probs(self, scores: List[float]) -> np.ndarray:
+        if not scores:
+            return np.array([], dtype=np.float64)
+        weights = []
+        for sc in scores:
+            w = 1.0
+            if sc > 0:
+                w *= 4.0
+            elif sc < 0:
+                w *= 2.5
+            w *= (1.0 + min(2.0, abs(sc) / 6.0))
+            weights.append(w)
+        probs = np.asarray(weights, dtype=np.float64)
+        total = probs.sum()
+        if total <= 0:
+            probs = np.full(len(scores), 1.0 / len(scores), dtype=np.float64)
+        else:
+            probs /= total
+        return probs
+
+    def _sample_from_buffer(self, buffer: deque, sample_size: int) -> List[Tuple[np.ndarray, float]]:
+        if sample_size <= 0 or len(buffer) == 0:
+            return []
+        actual = min(sample_size, len(buffer))
+        data = list(buffer)
+        scores = [float(sc) for _, sc in data]
+        probs = self._compute_sampling_probs(scores)
+        idxs = np.random.choice(len(data), size=actual, replace=False, p=probs)
+        return [data[i] for i in idxs]
+
+    def _buffer_size(self) -> int:
+        return len(self.random_buffer) + len(self.policy_buffer)
 
     def _engine_policy_generate_once(self, seed: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -533,19 +571,19 @@ class SelfPlayTrainer:
     
     def _collect_random_batch(self, batch_size: int, seed: int) -> Tuple[int, List[float]]:
         if _USE_CPP and _CPP is not None:
-            if self.parallel_random_gen is not None:
-                encoded_np, offsets_np, scores_np = self.parallel_random_gen.generate_random(int(batch_size), int(seed))
-            else:
-                encoded, offsets, scores_np = _CPP.generate_random_episodes(np.uint64(seed), int(batch_size))
-                encoded_np = np.asarray(encoded, dtype=np.float32)
-                offsets_np = np.asarray(offsets, dtype=np.int32)
-                scores_np = np.asarray(scores_np, dtype=np.float32)
-            if scores_np.size == 0:
-                return 0, []
-            self.add_encoded_to_buffer(encoded_np, offsets_np, scores_np)
+        if self.parallel_random_gen is not None:
+            encoded_np, offsets_np, scores_np = self.parallel_random_gen.generate_random(int(batch_size), int(seed))
+        else:
+            encoded, offsets, scores_np = _CPP.generate_random_episodes(np.uint64(seed), int(batch_size))
+            encoded_np = np.asarray(encoded, dtype=np.float32)
+            offsets_np = np.asarray(offsets, dtype=np.int32)
+            scores_np = np.asarray(scores_np, dtype=np.float32)
+        if scores_np.size == 0:
+            return 0, []
+        self.add_encoded_to_buffer(encoded_np, offsets_np, scores_np, is_random=True)
             return scores_np.shape[0], scores_np.tolist()
         episode_data = self.generate_episodes_parallel(batch_size, use_random=True, base_seed=seed)
-        scores = self._ingest_python_episode_data(episode_data)
+        scores = self._ingest_python_episode_data(episode_data, is_random=True)
         return len(scores), scores
     
     def _collect_model_batch(self, batch_size: int, seed: int) -> Tuple[int, List[float]]:
@@ -556,7 +594,7 @@ class SelfPlayTrainer:
                 enc2, offs, scores = self._engine_policy_generate_once(seed + i)
                 if scores.shape[0] == 0:
                     continue
-                self.add_encoded_to_buffer(enc2, offs, scores)
+                self.add_encoded_to_buffer(enc2, offs, scores, is_random=False)
                 collected += scores.shape[0]
                 scores_all.extend(scores.tolist())
             return collected, scores_all
@@ -564,23 +602,24 @@ class SelfPlayTrainer:
         for i in range(batch_size):
             episode = self.generate_episode(use_random=False, env_idx=i)
             episode_data.extend(episode)
-        scores = self._ingest_python_episode_data(episode_data)
+        scores = self._ingest_python_episode_data(episode_data, is_random=False)
         return len(scores), scores
     
-    def _ingest_python_episode_data(self, samples: List[Tuple[State, float]]) -> List[float]:
+    def _ingest_python_episode_data(self, samples: List[Tuple[State, float]], is_random: bool) -> List[float]:
         scores: List[float] = []
+        target_buffer = self.random_buffer if is_random else self.policy_buffer
         for state_or_encoded, score in samples:
             if isinstance(state_or_encoded, np.ndarray):
-                self.replay_buffer.append((state_or_encoded, float(score)))
+                target_buffer.append((state_or_encoded, float(score)))
             elif torch.is_tensor(state_or_encoded):
-                self.replay_buffer.append((state_or_encoded.detach().clone().float(), float(score)))
+                target_buffer.append((state_or_encoded.detach().clone().float(), float(score)))
             else:
-                self.replay_buffer.append((state_or_encoded, float(score)))
+                target_buffer.append((state_or_encoded, float(score)))
             scores.append(float(score))
         return scores
     
     def _train_cycle(self, num_updates: int) -> List[float]:
-        if len(self.replay_buffer) < self.batch_size or num_updates <= 0:
+        if self._buffer_size() < self.batch_size or num_updates <= 0:
             return []
         losses = []
         train_pbar = tqdm(range(num_updates), desc="Training", unit="update", leave=False, mininterval=0.5)
@@ -617,32 +656,29 @@ class SelfPlayTrainer:
         Returns:
             Loss value
         """
-        if len(self.replay_buffer) < self.batch_size:
+        total_available = len(self.random_buffer) + len(self.policy_buffer)
+        if total_available < self.batch_size:
             return 0.0
-        
-        # Sample batch with simple prioritization:
-        # - Fouled hands get higher weight
-        # - Larger |score| get higher weight (harder examples)
-        buf_list = list(self.replay_buffer)
-        scores_all = [float(sc) for _, sc in buf_list]
-        weights = []
-        for sc in scores_all:
-            w = 1.0
-            # Strongly prioritize positive-scoring (royalty) hands over neutral ones
-            if sc > 0:
-                w *= 4.0
-            # Still upweight fouls, but slightly less than big winners so we don't get stuck at neutral
-            elif sc < 0:
-                w *= 2.5
-            # Increase weight further with magnitude of outcome (big wins/losses > small ones)
-            w *= (1.0 + min(2.0, abs(sc) / 6.0))
-            weights.append(w)
-        # Normalize
-        total_w = sum(weights) if weights else 1.0
-        probs = [w / total_w for w in weights]
-        # Draw indices without replacement proportional to probs
-        idxs = np.random.choice(len(buf_list), size=self.batch_size, replace=False, p=np.asarray(probs, dtype=np.float64))
-        batch = [buf_list[i] for i in idxs]
+
+        rand_target = int(self.batch_size * self.random_sample_frac)
+        pol_target = self.batch_size - rand_target
+
+        rand_batch = self._sample_from_buffer(self.random_buffer, rand_target)
+        pol_batch = self._sample_from_buffer(self.policy_buffer, pol_target)
+
+        batch = rand_batch + pol_batch
+        if len(batch) < self.batch_size:
+            remaining = self.batch_size - len(batch)
+            # Prefer policy data for top-up if available
+            if len(self.policy_buffer) > len(self.random_buffer):
+                extra = self._sample_from_buffer(self.policy_buffer, remaining)
+                batch.extend(extra)
+            if len(batch) < self.batch_size:
+                extra = self._sample_from_buffer(self.random_buffer, self.batch_size - len(batch))
+                batch.extend(extra)
+        # Final safeguard
+        if len(batch) < self.batch_size:
+            return 0.0
         
         # Extract states and scores
         states = [s for s, _ in batch]
@@ -897,7 +933,7 @@ class SelfPlayTrainer:
                 update_budget += generated / max(1, episodes_per_batch) * self.max_updates_per_batch
             
             updates_ready = int(update_budget)
-            if updates_ready > 0 and len(self.replay_buffer) >= self.batch_size:
+            if updates_ready > 0 and self._buffer_size() >= self.batch_size:
                 updates_to_run = min(updates_ready, self.max_updates_per_batch)
                 losses = self._train_cycle(updates_to_run)
                 total_updates_run += updates_to_run
@@ -907,7 +943,7 @@ class SelfPlayTrainer:
             
             if eval_frequency > 0 and next_checkpoint is not None:
                 while next_checkpoint <= num_episodes and current_episode >= next_checkpoint:
-                    if len(self.replay_buffer) >= self.batch_size and update_budget > 0:
+                    if self._buffer_size() >= self.batch_size and update_budget > 0:
                         extra_updates = max(int(math.ceil(update_budget)), self.max_updates_per_batch)
                         losses = self._train_cycle(extra_updates)
                         total_updates_run += extra_updates
