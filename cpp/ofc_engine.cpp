@@ -644,8 +644,25 @@ py::tuple generate_random_episodes(uint64_t seed, int num_episodes) {
   auto offs = py::array_t<int32_t>({(ssize_t)offsets.size()});
   {
     auto O = offs.mutable_unchecked<1>();
+    // Copy element by element, verifying each write
     for (ssize_t i=0; i<(ssize_t)offsets.size(); ++i) {
-      O(i) = static_cast<int32_t>(offsets[i]);
+      int32_t val = static_cast<int32_t>(offsets[i]);
+      O(i) = val;
+      // Verify the write immediately (debug for Linux bug)
+      if (i < 5 || i >= (ssize_t)offsets.size() - 5) {
+        int32_t read_back = O(i);
+        if (read_back != val) {
+          std::cerr << "ERROR: Write failed at index " << i << ": wrote " << val << " but read " << read_back << std::endl;
+        }
+      }
+    }
+    // Final verification
+    std::cerr << "DEBUG: After mutable_unchecked copy, verifying:" << std::endl;
+    for (ssize_t i=0; i<std::min(5L, (ssize_t)offsets.size()); ++i) {
+      std::cerr << "  offs[" << i << "] = " << O(i) << " (expected " << offsets[i] << ")" << std::endl;
+    }
+    for (ssize_t i=std::max(0L, (ssize_t)offsets.size()-5); i<(ssize_t)offsets.size(); ++i) {
+      std::cerr << "  offs[" << i << "] = " << O(i) << " (expected " << offsets[i] << ")" << std::endl;
     }
   }
   py::array_t<float> scores({(ssize_t)final_scores.size()});
