@@ -181,6 +181,9 @@ class SelfPlayTrainer:
         # Maintain separate buffers so random self-play doesn't drown out policy data.
         self.random_buffer = deque(maxlen=buffer_size // 2)
         self.policy_buffer = deque(maxlen=buffer_size // 2)
+        # Backwards compatibility for tests and older code that expect a single replay_buffer.
+        # We alias it to the policy buffer so manual appends (e.g. in test_architecture) still work.
+        self.replay_buffer = self.policy_buffer
         
         self.optimizer = optim.Adam(model.parameters(), lr=learning_rate)
         self.criterion = nn.MSELoss()
