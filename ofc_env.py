@@ -66,9 +66,17 @@ class Action:
 class OfcEnv:
     """Open Face Chinese Poker Environment."""
     
-    def __init__(self, soft_mask: bool = True):
+    def __init__(self, soft_mask: bool = True, use_cpp: Optional[bool] = None):
         # If True, filter obviously foul-prone actions via cheap feasibility checks
         self.soft_mask = soft_mask
+        if use_cpp is None:
+            self._cpp = _CPP
+        elif use_cpp:
+            if _CPP is None:
+                raise RuntimeError("C++ backend requested but not available")
+            self._cpp = _CPP
+        else:
+            self._cpp = None
         self.reset()
     
     def _create_deck(self) -> List[Card]:
@@ -108,10 +116,10 @@ class OfcEnv:
         In rounds 1-4: choose 2 of 3 cards, place them
         """
         # C++ accelerated path for rounds 1..4 to reduce Python overhead
-        if _CPP is not None and state.round > 0:
+        if self._cpp is not None and state.round > 0:
             import numpy as _np
             board_arr = _np.array([c.to_int() if c is not None else -1 for c in state.board], dtype=_np.int16)
-            keeps, places = _CPP.legal_actions_rounds1to4(board_arr, int(state.round))
+            keeps, places = self._cpp.legal_actions_rounds1to4(board_arr, int(state.round))
             legal: List[Action] = []
             # Convert arrays to Action objects
             for i in range(keeps.shape[0]):
@@ -130,10 +138,10 @@ class OfcEnv:
         legal = []
         
         if state.round == 0:
-            if _CPP is not None:
+            if self._cpp is not None:
                 import numpy as _np
                 board_arr = _np.array([c.to_int() if c is not None else -1 for c in state.board], dtype=_np.int16)
-                placements = _CPP.legal_actions_round0(board_arr)
+                placements = self._cpp.legal_actions_round0(board_arr)
                 legal: List[Action] = []
                 for i in range(placements.shape[0]):
                     placement5 = [(int(placements[i,j,0]), int(placements[i,j,1])) for j in range(5)]
@@ -299,7 +307,7 @@ class OfcEnv:
         Reward is 0 during play, final score computed at end.
         """
         # C++ accelerated path for rounds 1..4
-        if _CPP is not None:
+        if self._cpp is not None:
             import numpy as _np
             # Prepare arrays for C++
             board_arr = _np.array([c.to_int() if c is not None else -1 for c in state.board], dtype=_np.int16)
@@ -307,30 +315,44 @@ class OfcEnv:
             if state.round == 0:
                 # Round 0 specialized path
                 current5 = _np.array([c.to_int() for c in state.current_draw], dtype=_np.int16)
-                slots5 = _np.array([p[1] for p in action.placements], dtype=_np.int16)
-                (b2, new_round, d2, deck2, done) = _CPP.step_state_round0(
+                slots5 = _np.full((5,), -1, dtype=_np.int16)
+                for card_idx, slot_idx in action.placements:
+                    idx = int(card_idx)
+                    if 0 <= idx < 5:
+                        slots5[idx] = int(slot_idx)
+                if (slots5 < 0).any():
+                    return self._step_python(state, action)
+                result = self._cpp.step_state_round0(
                     board_arr, current5, deck_arr, slots5
                 )
+                b2, new_round, d2, deck2, done = result
+                b2_np = _np.asarray(b2, dtype=_np.int16)
+                if b2_np.size == 0 or _np.all(b2_np < 0):
+                    return self._step_python(state, action)
+                board_source = b2_np
             else:
                 draw_arr = _np.full((3,), -1, dtype=_np.int16)
                 for i in range(min(3, len(state.current_draw))):
                     draw_arr[i] = state.current_draw[i].to_int()
                 keep_i, keep_j = action.keep_indices
-                (b2, new_round, d2, deck2, done) = _CPP.step_state(
+                (b2, new_round, d2, deck2, done) = self._cpp.step_state(
                     board_arr, int(state.round), draw_arr, deck_arr,
                     int(keep_i), int(keep_j),
                     int(action.placements[0][0]), int(action.placements[0][1]),
                     int(action.placements[1][0]), int(action.placements[1][1])
                 )
+                board_source = _np.asarray(b2, dtype=_np.int16)
             # Convert back to Python State
             from ofc_types import Card, Rank, Suit
             def int_to_card(v: int):
                 rank = Rank((v // 4) + 2)
                 suit = Suit(v % 4)
                 return Card(rank, suit)
-            new_board = [int_to_card(int(v)) if int(v) >= 0 else None for v in b2.tolist()]
-            next_draw = [int_to_card(int(v)) for v in d2.tolist() if int(v) >= 0]
-            new_deck = [int_to_card(int(v)) for v in deck2.tolist()]
+            draw_source = _np.asarray(d2, dtype=_np.int16)
+            deck_source = _np.asarray(deck2, dtype=_np.int16)
+            new_board = [int_to_card(int(v)) if int(v) >= 0 else None for v in board_source.tolist()]
+            next_draw = [int_to_card(int(v)) for v in draw_source.tolist() if int(v) >= 0]
+            new_deck = [int_to_card(int(v)) for v in deck_source.tolist()]
             
             # Debug: Check if C++ actually placed cards (only in evaluation context)
             import inspect
@@ -347,59 +369,49 @@ class OfcEnv:
             finally:
                 del frame
             
-            new_state = State(
+            return State(
                 board=new_board,
                 round=new_round,
                 current_draw=next_draw,
                 deck=new_deck,
                 cards_placed_this_round=len(action.placements)
-            )
-            return new_state, 0.0, bool(done)
+            ), 0.0, bool(done)
         
         # Fallback to Python implementation
-        # Fast copy using list() instead of .copy()
+        return self._step_python(state, action)
+
+    def _step_python(self, state: State, action: Action) -> Tuple[State, float, bool]:
+        """Pure Python implementation shared by fallback and C++ error paths."""
         new_board = list(state.board)
         new_deck = list(state.deck)
         
         if state.round == 0:
-            # Place all 5 cards
             for card_idx, slot_idx in action.placements:
                 new_board[slot_idx] = state.current_draw[card_idx]
-            
-            # Deal next 3 cards for round 1
             if len(new_deck) >= 3:
                 next_draw = [new_deck.pop(), new_deck.pop(), new_deck.pop()]
                 new_round = 1
             else:
                 next_draw = []
-                new_round = 5  # End game (round > 4)
+                new_round = 5
         else:
-            # Place 2 of 3 cards
             kept_cards = [state.current_draw[i] for i in action.keep_indices]
             for keep_idx, slot_idx in action.placements:
                 new_board[slot_idx] = kept_cards[keep_idx]
-            
-            # Move to next round
             new_round = state.round + 1
-            
-            # Deal next 3 cards if not done
             if new_round <= 4 and len(new_deck) >= 3:
                 next_draw = [new_deck.pop(), new_deck.pop(), new_deck.pop()]
             else:
                 next_draw = []
         
-        # Fast completion check
         done = new_round > 4 or all(slot is not None for slot in new_board)
-        
-        new_state = State(
+        return State(
             board=new_board,
             round=new_round,
             current_draw=next_draw,
             deck=new_deck,
             cards_placed_this_round=len(action.placements)
-        )
-        
-        return new_state, 0.0, done
+        ), 0.0, done
     
     def score(self, state: State) -> float:
         """
@@ -416,12 +428,12 @@ class OfcEnv:
         top_cards = [state.board[i] for i in range(10, 13)]
         
         # Try C++ accelerated scoring if available
-        if _CPP is not None:
+        if self._cpp is not None:
             import numpy as _np
             b = _np.array([c.to_int() for c in bottom_cards], dtype=_np.int16)
             m = _np.array([c.to_int() for c in middle_cards], dtype=_np.int16)
             t = _np.array([c.to_int() for c in top_cards], dtype=_np.int16)
-            s, fouled = _CPP.score_board_from_ints(b, m, t)
+            s, fouled = self._cpp.score_board_from_ints(b, m, t)
             return float(s)
         
         # Fallback to Python scoring

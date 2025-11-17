@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.optim as optim
 import random
 from collections import deque
+from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 import numpy as np
 from tqdm import tqdm
@@ -15,18 +16,16 @@ import os
 import glob
 import re
 import multiprocessing as mp
-from multiprocessing import Pool, Process, Queue
 
 # Try optional C++ backend
 _USE_CPP = os.getenv("OFC_USE_CPP", "1") == "1"
-_USE_ENGINE_POLICY = os.getenv("OFC_USE_ENGINE_POLICY", "0") == "1"
 try:
     import ofc_cpp as _CPP
 except Exception:
     _CPP = None
     _USE_CPP = False
 
-from ofc_env import State, Action
+from ofc_env import State, Action, OfcEnv
 # Note: OfcEnv import removed - training uses C++ workers exclusively
 # OfcEnv is only used in demo.py for interactive play
 from state_encoding import encode_state, encode_state_batch, get_input_dim
@@ -34,72 +33,44 @@ from value_net import ValueNet
 from action_selection import choose_best_action_beam_search
 
 
+@dataclass
+class TrainingStats:
+    total_hands: int = 0
+    total_score: float = 0.0
+    total_royalties: int = 0
+    total_fouls: int = 0
+    total_zero: int = 0
+    royalty_scores: List[float] = field(default_factory=list)
+
+    def observe(self, score: float):
+        self.total_hands += 1
+        self.total_score += float(score)
+        if score > 0:
+            self.total_royalties += 1
+            self.royalty_scores.append(float(score))
+        elif score < 0:
+            self.total_fouls += 1
+        else:
+            self.total_zero += 1
+
+    def observe_many(self, scores: List[float]):
+        for score in scores:
+            self.observe(score)
+
+    @property
+    def avg_score(self) -> float:
+        return self.total_score / max(1, self.total_hands)
+
+    @property
+    def foul_rate(self) -> float:
+        if self.total_hands == 0:
+            return 0.0
+        return (self.total_fouls / self.total_hands) * 100.0
+
+
 # NOTE: Python worker functions removed - all episode generation now uses C++ workers
 # via generate_random_episodes() for random episodes and engine_policy_generate_once()
 # for model-guided episodes. This ensures all game logic runs in C++.
-
-
-class ActionServer:
-    """
-    Central GPU action server that batches requests from workers and runs one large
-    forward pass on the GPU, then replies with best indices.
-    """
-    def __init__(self, model: ValueNet, device: torch.device, request_queue: Queue, response_queues, max_batch: int = 16384):
-        self.model = model
-        self.device = device
-        self.request_queue = request_queue
-        self.response_queues = response_queues
-        self.max_batch = max_batch
-        self._running = True
-        self.model.eval()
-
-    def stop(self):
-        self._running = False
-
-    def serve_once(self, timeout: float = 0.02) -> int:
-        """
-        Collect up to max_batch requests and serve them in one GPU forward.
-        Returns number of requests served.
-        """
-        batch = []
-        try:
-            item = self.request_queue.get(timeout=timeout)
-            batch.append(item)
-        except Exception:
-            return 0
-
-        while len(batch) < self.max_batch:
-            try:
-                item = self.request_queue.get_nowait()
-                batch.append(item)
-            except Exception:
-                break
-
-        # Build mega batch
-        tensors = []
-        splits = []
-        req_ids = []
-        for (request_id, num_actions, encoded_np) in batch:
-            tensors.append(torch.from_numpy(encoded_np))
-            splits.append(num_actions)
-            req_ids.append(request_id)
-
-        mega = torch.cat(tensors, dim=0).to(self.device, non_blocking=True)
-        with torch.no_grad():
-            vals, foul_logit, _, _ = self.model(mega)
-            values = vals.squeeze()
-            foul_prob = torch.sigmoid(foul_logit).squeeze()
-
-        # Respond
-        offset = 0
-        for request_id, num_actions in zip(req_ids, splits):
-            slice_vals = values[offset:offset+num_actions]
-            best_idx = 0 if slice_vals.dim() == 0 else int(slice_vals.argmax().item())
-            offset += num_actions
-            worker_id, _ = request_id
-            self.response_queues[worker_id].put((request_id, best_idx))
-
-        return len(batch)
 
 
 class SelfPlayTrainer:
@@ -148,12 +119,7 @@ class SelfPlayTrainer:
         self.num_workers = num_workers
         self.pool = None  # No longer used - C++ handles parallelism
         print(f"C++ Workers: Engine will use up to {num_workers} parallel environments")
-        # Centralized action serving infra (lazy init)
-        self.request_queue: Optional[Queue] = None
-        self.response_queues = None
 
-        # Engine-policy settings (Phase 2)
-        self.use_engine_policy = _USE_ENGINE_POLICY and (_CPP is not None)
         # Configure default engine parameters
         self.engine_num_envs = max(64, min(256, self.num_workers))  # more envs
         self.engine_max_candidates = 192  # stronger exploration
@@ -228,7 +194,6 @@ class SelfPlayTrainer:
         
         # Fallback: Python path (only if C++ not available)
         # This should rarely be used in production
-        from ofc_env import OfcEnv
         env = OfcEnv()
         state = env.reset()
         episode_states = []
@@ -319,40 +284,6 @@ class SelfPlayTrainer:
             all_data.extend(episode_data)
         return all_data
     
-    def generate_episodes_parallel_with_server(self, num_episodes: int, base_seed: int = 0) -> List[List[Tuple[State, float]]]:
-        """
-        Parallel net-based episodes using C++ engine with GPU action server.
-        Uses C++ engine's request_policy_batch → GPU forward → apply_policy_actions flow.
-        This is the primary method for model-guided episode generation with C++ workers.
-        """
-        if _CPP is None:
-            # Fallback to single-process if C++ not available
-            episodes = []
-            for i in range(num_episodes):
-                episode_data = self.generate_episode(use_random=False, env_idx=i)
-                episodes.append(episode_data)
-            return episodes
-        
-        # Use C++ engine for parallel episode generation
-        # The engine handles multiple environments internally
-        episodes = []
-        for i in range(num_episodes):
-            seed = base_seed + i
-            enc2, offs, scores = self._engine_policy_generate_once(seed)
-            # Convert to list of (state, score) tuples per episode
-            if scores.shape[0] > 0:
-                episode_data = []
-                for e in range(scores.shape[0]):
-                    s0 = int(offs[e])
-                    s1 = int(offs[e+1])
-                    score = float(scores[e])
-                    # Store encoded states (not State objects) for efficiency
-                    for s in range(s0, s1):
-                        episode_data.append((enc2[s], score))
-                episodes.append(episode_data)
-        
-        return episodes
-    
     def _choose_action_with_net(self, state: State, legal_actions: List[Action], env_idx: int = 0) -> Action:
         """
         Choose action using value network (greedy) - batched for GPU efficiency.
@@ -363,7 +294,6 @@ class SelfPlayTrainer:
             return None
         
         # Fallback: Use Python OfcEnv only if C++ not available
-        from ofc_env import OfcEnv
         env = OfcEnv()
         
         # Temporarily set model to eval mode
@@ -468,6 +398,90 @@ class SelfPlayTrainer:
             return enc2, offs, scores
         finally:
             _CPP.destroy_engine(h)
+    
+    def _random_probability(self, absolute_episode: int) -> float:
+        total_anneal = self.random_phase_episodes + self.anneal_phase_episodes
+        if absolute_episode < self.random_phase_episodes:
+            return 1.0
+        if absolute_episode < total_anneal:
+            t = (absolute_episode - self.random_phase_episodes) / max(1, self.anneal_phase_episodes)
+            return 1.0 - t * (1.0 - self.min_random_prob)
+        return self.min_random_prob
+    
+    def _collect_random_batch(self, batch_size: int, seed: int) -> Tuple[int, List[float]]:
+        if _USE_CPP and _CPP is not None:
+            encoded, offsets, scores_np = _CPP.generate_random_episodes(np.uint64(seed), int(batch_size))
+            encoded_np = np.array(encoded, copy=False)
+            offsets_np = np.array(offsets, dtype=np.int32)
+            scores_np = np.array(scores_np, dtype=np.float32)
+            if scores_np.size == 0:
+                return 0, []
+            self.add_encoded_to_buffer(encoded_np, offsets_np, scores_np)
+            return scores_np.shape[0], scores_np.tolist()
+        episode_data = self.generate_episodes_parallel(batch_size, use_random=True, base_seed=seed)
+        scores = self._ingest_python_episode_data(episode_data)
+        return len(scores), scores
+    
+    def _collect_model_batch(self, batch_size: int, seed: int) -> Tuple[int, List[float]]:
+        if _CPP is not None:
+            collected = 0
+            scores_all: List[float] = []
+            for i in range(batch_size):
+                enc2, offs, scores = self._engine_policy_generate_once(seed + i)
+                if scores.shape[0] == 0:
+                    continue
+                self.add_encoded_to_buffer(enc2, offs, scores)
+                collected += scores.shape[0]
+                scores_all.extend(scores.tolist())
+            return collected, scores_all
+        episode_data = []
+        for i in range(batch_size):
+            episode = self.generate_episode(use_random=False, env_idx=i)
+            episode_data.extend(episode)
+        scores = self._ingest_python_episode_data(episode_data)
+        return len(scores), scores
+    
+    def _ingest_python_episode_data(self, samples: List[Tuple[State, float]]) -> List[float]:
+        scores: List[float] = []
+        for state_or_encoded, score in samples:
+            if isinstance(state_or_encoded, np.ndarray):
+                self.replay_buffer.append((state_or_encoded, float(score)))
+            elif torch.is_tensor(state_or_encoded):
+                self.replay_buffer.append((state_or_encoded.detach().clone().float(), float(score)))
+            else:
+                self.replay_buffer.append((state_or_encoded, float(score)))
+            scores.append(float(score))
+        return scores
+    
+    def _train_cycle(self, num_updates: int) -> List[float]:
+        if len(self.replay_buffer) < self.batch_size or num_updates <= 0:
+            return []
+        losses = []
+        train_pbar = tqdm(range(num_updates), desc="Training", unit="update", leave=False, mininterval=0.5)
+        for _ in train_pbar:
+            loss = self.train_step()
+            losses.append(loss)
+        train_pbar.close()
+        avg_loss = np.mean(losses) if losses else 0.0
+        print(f"Training complete. Average loss: {avg_loss:.4f}\n")
+        return losses
+    
+    def _run_checkpoint(self, episode: int, stats: TrainingStats, avg_loss: Optional[float]):
+        print(f"\n{'='*60}")
+        print(f"Checkpoint at episode {episode:,}")
+        print(f"{'='*60}\n")
+        if avg_loss is not None:
+            print(f"Average training loss: {avg_loss:.4f}")
+        training_foul_rate = stats.foul_rate
+        avg_score_per_hand = stats.avg_score
+        self._evaluate(
+            stats=stats,
+            training_foul_rate=training_foul_rate,
+            avg_score_per_hand=avg_score_per_hand
+        )
+        checkpoint_path = f'value_net_checkpoint_ep{episode}.pth'
+        torch.save(self.model.state_dict(), checkpoint_path)
+        print(f"\nCheckpoint saved: {checkpoint_path}\n")
     
     def train_step(self) -> float:
         """
@@ -575,7 +589,6 @@ class SelfPlayTrainer:
             if hasattr(states[0], "board"):
                 round0_indices = [i for i, s in enumerate(states) if getattr(s, "round", 1) == 0]
                 if round0_indices:
-                    from ofc_env import OfcEnv
                     env_tmp = OfcEnv(soft_mask=False)
                     labels = []
                     idx_keep = []
@@ -666,434 +679,110 @@ class SelfPlayTrainer:
             eval_frequency: How often to evaluate (in episodes)
         """
         start_time = time.time()
-        losses = []
-        total_royalties = 0
-        total_fouls = 0
-        total_zero = 0
-        royalty_scores = []
-        total_score = 0.0  # Track total score for average calculation
+        losses: List[float] = []
+        stats = TrainingStats()
         start_episode = 0
         checkpoint_loaded = None
         original_target = num_episodes
         
-        # Always try to resume from checkpoint if available
         if resume:
             checkpoint_info = self.find_latest_checkpoint()
             if checkpoint_info:
                 checkpoint_path, checkpoint_episode = checkpoint_info
-                # Always load the checkpoint to continue training
                 self.load_checkpoint(checkpoint_path)
                 checkpoint_loaded = checkpoint_episode
                 start_episode = checkpoint_episode + 1
-                
-                # If checkpoint is at or past target, extend training
                 if checkpoint_episode >= num_episodes:
-                    # Extend target to continue training
                     num_episodes = checkpoint_episode + original_target
         
-        # Print training information
         print(f"\n{'='*60}")
-        print(f"Starting RL Training")
+        print("Starting RL Training")
         print(f"{'='*60}")
         if checkpoint_loaded is not None:
             print(f"Checkpoint Loaded: {checkpoint_loaded:,}")
             print(f"This Training will do (hands): {num_episodes - start_episode:,}")
-            print(f"Total by end: {num_episodes:,}")
         else:
             print(f"This Training will do (hands): {num_episodes:,}")
-            print(f"Total by end: {num_episodes:,}")
+        print(f"Total by end: {num_episodes:,}")
         print(f"Device: {self.device}")
         print(f"Buffer size: {self.buffer_size:,}")
         print(f"Batch size: {self.batch_size}")
         print(f"{'='*60}\n")
         
-        # Progress bar for episodes (starting from resume point)
         pbar = tqdm(
-            range(start_episode, num_episodes),
+            total=num_episodes,
             desc="Generating episodes",
             unit="hand",
             initial=start_episode,
-            total=num_episodes,
-            mininterval=0.1,  # Update more frequently for smoother progress
-            smoothing=0.1,   # Add slight smoothing to reduce jitter
-            dynamic_ncols=False
+            mininterval=0.1,
+            smoothing=0.1,
         )
         
-        # Generate episodes in batches sized to reduce blocking pauses
-        episodes_per_batch = max(self.num_workers, 32)  # Smaller batches for smoother progress
-        # Train at every checkpoint (25k, 50k, 75k, 100k)
-        episodes_per_train_step = eval_frequency  # Train at same frequency as checkpoints
-        updates_per_cycle = 1024  # Reasonable number of updates per checkpoint
+        episodes_per_batch = max(self.num_workers, episodes_per_update, 32)
+        processed_checkpoints = set()
+        current_episode = start_episode
+        updates_per_cycle = 1024
         
-        episode_idx = 0
-        # Very smooth progress bar updates
-        pbar_update_stride = 1  # Update every episode for maximum smoothness
-        since_last_update = 0
-        # Track which checkpoints we've already evaluated to avoid duplicates
-        evaluated_checkpoints = set()
-        # Track which episodes we've already trained at to avoid duplicates
-        trained_episodes = set()
-        # Throughput-first: 100% random batches for maximum hands/sec
-        while start_episode + episode_idx < num_episodes:
-            # Calculate how many episodes to generate in this batch
-            remaining = num_episodes - (start_episode + episode_idx)
+        while current_episode < num_episodes:
+            remaining = num_episodes - current_episode
             batch_size_current = min(episodes_per_batch, remaining)
+            use_random = np.random.rand() < self._random_probability(current_episode)
+            seed = int(current_episode * 1000)
             
-            # Calculate absolute episode number at start of batch
-            absolute_episode_start = start_episode + episode_idx
-            
-            # Hybrid exploration schedule - calculate random prob for this batch
-            # Use the episode count at the START of the batch to decide exploration
-            if absolute_episode_start < self.random_phase_episodes:
-                random_prob = 1.0
-            elif absolute_episode_start < (self.random_phase_episodes + self.anneal_phase_episodes):
-                t = (absolute_episode_start - self.random_phase_episodes) / max(1, self.anneal_phase_episodes)
-                # 1.0 -> min_random_prob linearly
-                random_prob = 1.0 - t * (1.0 - self.min_random_prob)
+            if use_random:
+                generated, batch_scores = self._collect_random_batch(batch_size_current, seed)
             else:
-                random_prob = self.min_random_prob
-            # Stochastic choice per batch
-            use_random_for_batch = (np.random.rand() < random_prob)
+                generated, batch_scores = self._collect_model_batch(batch_size_current, seed)
             
-            # Generate batch of episodes
-            if use_random_for_batch:
-                episodes_generated = 0
-                if _USE_CPP and _CPP is not None:
-                    # Single C++ call generates many random episodes efficiently
-                    seed = int(absolute_episode_start * 1000)
-                    encoded, offsets, scores_np = _CPP.generate_random_episodes(np.uint64(seed), int(batch_size_current))
-                    # Numpy arrays
-                    encoded_np = np.array(encoded, copy=False)            # [S,838] float32
-                    offsets_np = np.array(offsets, dtype=np.int32)  # [E+1]
-                    scores_np = np.array(scores_np, dtype=np.float32)  # [E]
-                    # Update statistics and buffer
-                    self.add_encoded_to_buffer(encoded_np, offsets_np, scores_np)
-                    episodes_generated = scores_np.shape[0]
-                    # Track stats
-                    final_scores_batch = scores_np.tolist()
-                    for final_score in final_scores_batch:
-                        total_score += float(final_score)
-                        if final_score > 0:
-                            total_royalties += 1
-                            royalty_scores.append(float(final_score))
-                        elif final_score < 0:
-                            total_fouls += 1
-                        else:
-                            total_zero += 1
-                else:
-                    # Fallback: Python path (only if C++ not available)
-                    all_episode_data = self.generate_episodes_parallel(
-                        batch_size_current,
-                        use_random=True,
-                        base_seed=absolute_episode_start * 1000
-                    )
-                    # Process episode data (may be encoded arrays or State objects)
-                    for state_or_encoded, score in all_episode_data:
-                        # If it's an encoded array, add directly to buffer
-                        if isinstance(state_or_encoded, np.ndarray):
-                            self.replay_buffer.append((state_or_encoded, score))
-                            episodes_generated += 1
-                            total_score += float(score)
-                            if score > 0:
-                                total_royalties += 1
-                                royalty_scores.append(float(score))
-                            elif score < 0:
-                                total_fouls += 1
-                            else:
-                                total_zero += 1
-                        else:
-                            # Legacy State object path (shouldn't happen with C++)
-                            self.add_to_buffer([(state_or_encoded, score)])
-                            episodes_generated += 1
-                            total_score += float(score)
-                            if score > 0:
-                                total_royalties += 1
-                                royalty_scores.append(float(score))
-                            elif score < 0:
-                                total_fouls += 1
-                            else:
-                                total_zero += 1
-            else:
-                # Model-guided episode generation (non-random) using C++ engine
-                episodes_generated = 0
-                if _USE_CPP and _CPP is not None:
-                    # Use C++ engine for parallel model-guided episodes
-                    # Generate episodes in batches using engine
-                    for i in range(batch_size_current):
-                        seed = int(absolute_episode_start * 1000) + i
-                        enc2, offs, scores = self._engine_policy_generate_once(seed)
-                        if scores.shape[0] > 0:
-                            # Add encoded states to buffer
-                            self.add_encoded_to_buffer(enc2, offs, scores)
-                            episodes_generated += scores.shape[0]
-                            # Track stats
-                            for final_score in scores.tolist():
-                                total_score += float(final_score)
-                                if final_score > 0:
-                                    total_royalties += 1
-                                    royalty_scores.append(float(final_score))
-                                elif final_score < 0:
-                                    total_fouls += 1
-                                else:
-                                    total_zero += 1
-                else:
-                    # Fallback: Python path (only if C++ not available)
-                    all_episode_data = []
-                    for i in range(batch_size_current):
-                        episode_data = self.generate_episode(use_random=False, env_idx=i)
-                        if episode_data:
-                            all_episode_data.extend(episode_data)
-                            final_score = episode_data[-1][1]
-                            total_score += final_score
-                            if final_score > 0:
-                                total_royalties += 1
-                                royalty_scores.append(float(final_score))
-                            elif final_score < 0:
-                                total_fouls += 1
-                            else:
-                                total_zero += 1
-                            episodes_generated += 1
-                    # Add all to buffer
-                    for state_or_encoded, score in all_episode_data:
-                        if isinstance(state_or_encoded, np.ndarray):
-                            self.replay_buffer.append((state_or_encoded, score))
-                        else:
-                            self.add_to_buffer([(state_or_encoded, score)])
+            generated = min(generated, batch_size_current, len(batch_scores))
+            if generated == 0:
+                continue
             
+            stats.observe_many(batch_scores[:generated])
+            current_episode += generated
+            pbar.update(generated)
+            pbar.set_postfix_str("random" if use_random else "model")
             
-            # Update progress and training using episodes_generated
-            eval_ran_this_batch = False
-            for _ in range(episodes_generated):
-                episode_idx += 1
-                absolute_episode = start_episode + episode_idx - 1
-                since_last_update += 1
-                if since_last_update >= pbar_update_stride:
-                    pbar.update(since_last_update)
-                    since_last_update = 0
-                # Train in bursts after large generation windows (but skip if we're at a checkpoint - handled there)
-                if len(self.replay_buffer) >= self.batch_size and episode_idx % episodes_per_train_step == 0:
-                    # Only train here if NOT at a checkpoint (checkpoints handle training separately)
-                    # Also check if we've already trained at this episode
-                    if (absolute_episode not in trained_episodes and 
-                        not (absolute_episode >= eval_frequency and absolute_episode % eval_frequency == 0)):
-                        trained_episodes.add(absolute_episode)
-                        pbar.clear()
-                        print(f"\n[Episode {absolute_episode:,}] Training cycle ({updates_per_cycle} gradient updates)")
-                        train_pbar = tqdm(range(updates_per_cycle), desc="Training", unit="update", leave=False, mininterval=0.5)
-                        for update_idx in train_pbar:
-                            loss = self.train_step()
-                            losses.append(loss)
-                        train_pbar.close()
-                        avg_loss = np.mean(losses[-updates_per_cycle:])
-                        print(f"Training complete. Average loss: {avg_loss:.4f}\n")
-                # Periodic evaluation and checkpointing
-                # At checkpoints: Training → Evaluation → Save checkpoint
-                if absolute_episode >= eval_frequency and absolute_episode % eval_frequency == 0:
-                    if absolute_episode not in evaluated_checkpoints:
-                        eval_ran_this_batch = True
-                        evaluated_checkpoints.add(absolute_episode)
-                        pbar.clear()
-                        print(f"\n{'='*60}")
-                        print(f"Checkpoint at episode {absolute_episode:,}")
-                        print(f"{'='*60}\n")
-                        import sys
-                        sys.stdout.flush()
-                        
-                        # Step 1: Training (if needed and not already done)
-                        if (len(self.replay_buffer) >= self.batch_size and 
-                            absolute_episode % episodes_per_train_step == 0 and
-                            absolute_episode not in trained_episodes):
-                            trained_episodes.add(absolute_episode)
-                            print(f"[Episode {absolute_episode:,}] Training cycle ({updates_per_cycle} gradient updates)")
-                            train_pbar = tqdm(range(updates_per_cycle), desc="Training", unit="update", leave=False, mininterval=0.5)
-                            for update_idx in train_pbar:
-                                loss = self.train_step()
-                                losses.append(loss)
-                            train_pbar.close()
-                            avg_loss = np.mean(losses[-updates_per_cycle:])
-                            print(f"Training complete. Average loss: {avg_loss:.4f}\n")
-                        
-                        # Step 2: Evaluation
-                        print(f"--- Evaluation at episode {absolute_episode:,} ---\n")
-                        training_foul_rate = (total_fouls / (absolute_episode + 1)) * 100 if absolute_episode > 0 else 0
-                        avg_score_per_hand = total_score / (absolute_episode + 1) if absolute_episode > 0 else 0.0
-                        self._evaluate(total_episodes=absolute_episode+1, total_fouls=total_fouls, 
-                                      total_royalties=total_royalties, total_zero=total_zero,
-                                      training_foul_rate=training_foul_rate,
-                                      avg_score_per_hand=avg_score_per_hand)
-                        sys.stdout.flush()
-                        
-                        # Step 3: Save checkpoint
-                        checkpoint_path = f'value_net_checkpoint_ep{absolute_episode}.pth'
-                        torch.save(self.model.state_dict(), checkpoint_path)
-                        print(f"\nCheckpoint saved: {checkpoint_path}\n")
-                        sys.stdout.flush()
-            
-            # Check if we passed a checkpoint after batch processing (only if we didn't evaluate in loop)
-            if not eval_ran_this_batch and episodes_generated > 0:
-                episode_after_batch = start_episode + episode_idx - 1
-                # Check if we're at or past a checkpoint
-                if episode_after_batch >= eval_frequency:
-                    last_checkpoint = (episode_after_batch // eval_frequency) * eval_frequency
-                    # Only evaluate if we haven't already evaluated this checkpoint
-                    if last_checkpoint not in evaluated_checkpoints and episode_after_batch >= last_checkpoint:
-                        evaluated_checkpoints.add(last_checkpoint)
-                        pbar.clear()
-                        print(f"\n{'='*60}")
-                        print(f"Checkpoint at episode {last_checkpoint:,}")
-                        print(f"{'='*60}\n")
-                        import sys
-                        sys.stdout.flush()
-                        
-                        # Step 1: Training (if needed and not already done)
-                        if (len(self.replay_buffer) >= self.batch_size and 
-                            last_checkpoint % episodes_per_train_step == 0 and
-                            last_checkpoint not in trained_episodes):
-                            trained_episodes.add(last_checkpoint)
-                            print(f"[Episode {last_checkpoint:,}] Training cycle ({updates_per_cycle} gradient updates)")
-                            train_pbar = tqdm(range(updates_per_cycle), desc="Training", unit="update", leave=False, mininterval=0.5)
-                            for update_idx in train_pbar:
-                                loss = self.train_step()
-                                losses.append(loss)
-                            train_pbar.close()
-                            avg_loss = np.mean(losses[-updates_per_cycle:])
-                            print(f"Training complete. Average loss: {avg_loss:.4f}\n")
-                        
-                        # Step 2: Evaluation
-                        print(f"--- Evaluation at episode {last_checkpoint:,} ---\n")
-                        training_foul_rate = (total_fouls / (episode_after_batch + 1)) * 100 if episode_after_batch > 0 else 0
-                        avg_score_per_hand = total_score / (episode_after_batch + 1) if episode_after_batch > 0 else 0.0
-                        self._evaluate(total_episodes=episode_after_batch+1, total_fouls=total_fouls, 
-                                      total_royalties=total_royalties, total_zero=total_zero,
-                                      training_foul_rate=training_foul_rate,
-                                      avg_score_per_hand=avg_score_per_hand)
-                        sys.stdout.flush()
-                        
-                        # Step 3: Save checkpoint
-                        checkpoint_path = f'value_net_checkpoint_ep{last_checkpoint}.pth'
-                        torch.save(self.model.state_dict(), checkpoint_path)
-                        print(f"\nCheckpoint saved: {checkpoint_path}\n")
-                        sys.stdout.flush()
-            
-            if self.use_engine_policy:
-                # Engine policy path: GPU-assisted selection
-                seed = int(absolute_episode_start * 1000)
-                enc2, offs, scores = self._engine_policy_generate_once(seed)
-                # Update buffer and stats
-                if scores.shape[0] > 0:
-                    self.add_encoded_to_buffer(enc2, offs, scores)
-                    for final_score in scores.tolist():
-                        total_score += float(final_score)
-                        if final_score > 0:
-                            total_royalties += 1
-                            royalty_scores.append(float(final_score))
-                        elif final_score < 0:
-                            total_fouls += 1
-                        else:
-                            total_zero += 1
-                episodes_generated = int(scores.shape[0])
-                # Update progress and training using episodes_generated
-                for _ in range(episodes_generated):
-                    episode_idx += 1
-                    absolute_episode = start_episode + episode_idx - 1
-                    since_last_update += 1
-                    if since_last_update >= pbar_update_stride:
-                        pbar.update(since_last_update)
-                        since_last_update = 0
-                    if len(self.replay_buffer) >= self.batch_size and episode_idx % episodes_per_train_step == 0:
-                        # Only train here if NOT at a checkpoint (checkpoints handle training separately)
-                        # Also check if we've already trained at this episode
-                        if (absolute_episode not in trained_episodes and
-                            not (absolute_episode >= eval_frequency and absolute_episode % eval_frequency == 0)):
-                            trained_episodes.add(absolute_episode)
-                            pbar.clear()
-                            print(f"\n[Episode {absolute_episode:,}] Training cycle ({updates_per_cycle} gradient updates)")
-                            train_pbar = tqdm(range(updates_per_cycle), desc="Training", unit="update", leave=False, mininterval=0.5)
-                            for update_idx in train_pbar:
-                                loss = self.train_step()
-                                losses.append(loss)
-                            train_pbar.close()
-                            avg_loss = np.mean(losses[-updates_per_cycle:])
-                            print(f"Training complete. Average loss: {avg_loss:.4f}\n")
+            if (eval_frequency > 0 and current_episode % eval_frequency == 0 and
+                    current_episode not in processed_checkpoints):
+                new_losses = self._train_cycle(updates_per_cycle)
+                losses.extend(new_losses)
+                avg_loss = float(np.mean(new_losses)) if new_losses else None
+                self._run_checkpoint(current_episode, stats, avg_loss)
+                processed_checkpoints.add(current_episode)
         
         pbar.close()
-        # Flush any remaining progress not reflected due to batching
-        if since_last_update > 0:
-            try:
-                pbar.update(since_last_update)
-            except Exception:
-                pass
         
-        # Final checkpoint handling (only if we didn't already process it)
-        # Check if the target episode (num_episodes) was already evaluated as a checkpoint
-        # If it was, skip - evaluation already done. If not, process it now.
-        if num_episodes not in evaluated_checkpoints:
-            # Final checkpoint wasn't processed during the loop, process it now
-            if num_episodes >= eval_frequency and num_episodes % eval_frequency == 0:
-                final_episode = num_episodes
-                pbar.clear()
-                print(f"\n{'='*60}")
-                print(f"Checkpoint at episode {final_episode:,}")
-                print(f"{'='*60}\n")
-                import sys
-                sys.stdout.flush()
-                
-                # Step 1: Training (if needed and not already done)
-                if (len(self.replay_buffer) >= self.batch_size and 
-                    final_episode % episodes_per_train_step == 0 and
-                    final_episode not in trained_episodes):
-                    trained_episodes.add(final_episode)
-                    print(f"[Episode {final_episode:,}] Training cycle ({updates_per_cycle} gradient updates)")
-                    train_pbar = tqdm(range(updates_per_cycle), desc="Training", unit="update", leave=False, mininterval=0.5)
-                    for update_idx in train_pbar:
-                        loss = self.train_step()
-                        losses.append(loss)
-                    train_pbar.close()
-                    avg_loss = np.mean(losses[-updates_per_cycle:])
-                    print(f"Training complete. Average loss: {avg_loss:.4f}\n")
-                
-                # Step 2: Evaluation
-                print(f"--- Evaluation at episode {final_episode:,} ---\n")
-                training_foul_rate = (total_fouls / (final_episode + 1)) * 100 if final_episode > 0 else 0
-                avg_score_per_hand = total_score / (final_episode + 1) if final_episode > 0 else 0.0
-                self._evaluate(total_episodes=final_episode+1, total_fouls=total_fouls, 
-                              total_royalties=total_royalties, total_zero=total_zero,
-                              training_foul_rate=training_foul_rate,
-                              avg_score_per_hand=avg_score_per_hand)
-                sys.stdout.flush()
-                
-                # Step 3: Save checkpoint
-                checkpoint_path = f'value_net_checkpoint_ep{final_episode}.pth'
-                torch.save(self.model.state_dict(), checkpoint_path)
-                print(f"\nCheckpoint saved: {checkpoint_path}\n")
-                sys.stdout.flush()
-                evaluated_checkpoints.add(final_episode)
-        # If num_episodes was already in evaluated_checkpoints, skip - evaluation already done
+        if (eval_frequency > 0 and num_episodes % eval_frequency == 0 and
+                num_episodes not in processed_checkpoints):
+            new_losses = self._train_cycle(updates_per_cycle)
+            losses.extend(new_losses)
+            avg_loss = float(np.mean(new_losses)) if new_losses else None
+            self._run_checkpoint(num_episodes, stats, avg_loss)
         
+        elapsed = time.time() - start_time
         print(f"\n{'='*60}")
         print("Training Complete!")
         print(f"{'='*60}")
-        elapsed = time.time() - start_time
         print(f"Total time: {elapsed/3600:.2f} hours ({elapsed:.0f} seconds)")
-        print(f"Episodes: {num_episodes:,}")
-        print(f"Average time per episode: {elapsed/num_episodes*1000:.2f} ms")
+        print(f"Episodes (target): {num_episodes:,}")
+        if num_episodes > 0:
+            print(f"Average time per episode: {elapsed/num_episodes*1000:.2f} ms")
         print(f"{'='*60}\n")
-        
-        # Final summary statistics (evaluation already done at final checkpoint)
-        training_foul_rate = (total_fouls / num_episodes) * 100 if num_episodes > 0 else 0
-        avg_score_per_hand = total_score / num_episodes if num_episodes > 0 else 0.0
         print("Final Training Statistics:")
-        print(f"  Total Hands: {num_episodes:,}")
-        print(f"  Hands Fouled: {total_fouls}/{num_episodes} ({training_foul_rate:.1f}%)")
-        print(f"  Hands Scored 0: {total_zero}/{num_episodes} ({total_zero/num_episodes*100:.1f}%)")
-        print(f"  Hands with Royalties: {total_royalties}/{num_episodes} ({total_royalties/num_episodes*100:.2f}%)")
-        print(f"  Average Score Per Hand: {avg_score_per_hand:.2f}")
-        print()
+        print(f"  Total Hands Recorded: {stats.total_hands:,}")
+        print(f"  Hands Fouled: {stats.total_fouls}/{max(1, stats.total_hands)} ({stats.foul_rate:.1f}%)")
+        zero_rate = (stats.total_zero / stats.total_hands * 100) if stats.total_hands else 0.0
+        royalty_rate = (stats.total_royalties / stats.total_hands * 100) if stats.total_hands else 0.0
+        print(f"  Hands Scored 0: {stats.total_zero}/{max(1, stats.total_hands)} ({zero_rate:.1f}%)")
+        print(f"  Hands with Royalties: {stats.total_royalties}/{max(1, stats.total_hands)} ({royalty_rate:.2f}%)")
+        print(f"  Average Score Per Hand: {stats.avg_score:.2f}\n")
     
-    def _evaluate(self, total_episodes: int = 0, total_fouls: int = 0, 
-                  total_royalties: int = 0, total_zero: int = 0, 
+    def _evaluate(self, stats: Optional[TrainingStats] = None,
                   training_foul_rate: float = 0.0, avg_score_per_hand: float = 0.0):
         """Evaluate model on test episodes."""
+        if stats is None:
+            stats = TrainingStats()
         self.model.eval()
         test_scores = []
         test_fouls = 0
@@ -1104,18 +793,11 @@ class SelfPlayTrainer:
         royalties_mid_ct = 0
         royalties_bot_ct = 0
         
+        eval_env = OfcEnv(use_cpp=False)
         with torch.no_grad():
             eval_pbar = tqdm(range(500), desc="Evaluating", unit="hand", leave=False, mininterval=0.5)
             for eval_idx in eval_pbar:
-                # For evaluation, use Python path to ensure reliable single-episode generation
-                # This is more reliable than the C++ engine for single episodes
-                # Force Python path by temporarily disabling C++ in the module
-                from ofc_env import OfcEnv, _CPP as _CPP_ORIG
-                import ofc_env
-                old_cpp = ofc_env._CPP
-                ofc_env._CPP = None  # Force Python path
-                env = OfcEnv()
-                ofc_env._CPP = old_cpp  # Restore
+                env = eval_env
                 state = env.reset()
                 
                 # Verify reset worked correctly
@@ -1232,13 +914,15 @@ class SelfPlayTrainer:
             min_score = np.min(test_scores)
             foul_rate = test_fouls / len(test_scores) * 100
             
-            if total_episodes > 0:
+            if stats.total_hands > 0:
                 print(f"{'='*23}")
                 print(f"Training Statistics:")
-                print(f"    Total Hands: {total_episodes:,}")
-                print(f"    Hands Fouled: {total_fouls:,}/{total_episodes:,} ({training_foul_rate:.1f}%)")
-                print(f"    Hands Scored 0: {total_zero:,}/{total_episodes:,} ({total_zero/total_episodes*100:.1f}%)")
-                print(f"    Hands with Royalties: {total_royalties:,}/{total_episodes:,} ({total_royalties/total_episodes*100:.2f}%)")
+                print(f"    Total Hands: {stats.total_hands:,}")
+                print(f"    Hands Fouled: {stats.total_fouls:,}/{stats.total_hands:,} ({training_foul_rate:.1f}%)")
+                zero_rate = (stats.total_zero / stats.total_hands * 100) if stats.total_hands else 0.0
+                royalty_rate = (stats.total_royalties / stats.total_hands * 100) if stats.total_hands else 0.0
+                print(f"    Hands Scored 0: {stats.total_zero:,}/{stats.total_hands:,} ({zero_rate:.1f}%)")
+                print(f"    Hands with Royalties: {stats.total_royalties:,}/{stats.total_hands:,} ({royalty_rate:.2f}%)")
                 print(f"    Average Score Per Hand: {avg_score_per_hand:.2f}")
                 print()
             
