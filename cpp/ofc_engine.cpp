@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <iostream>
 #include <cassert>
+#include <cstring>
 
 // Windows compatibility: ssize_t is not available on MSVC, use Py_ssize_t instead
 #ifdef _WIN32
@@ -638,20 +639,31 @@ py::tuple generate_random_episodes(uint64_t seed, int num_episodes) {
     }
   }
   
-  // Create offsets array - use explicit memory allocation and copy
-  // CRITICAL: Allocate new array and copy each value individually to avoid view/reference issues
-  py::array_t<int32_t> offs({(ssize_t)offsets.size()});
+  // Create offsets array - CRITICAL: Copy to temporary vector first, then to array
+  // This ensures we have a stable copy before creating the numpy array
+  ssize_t offs_size = (ssize_t)offsets.size();
+  std::vector<int32_t> offsets_stable(offs_size);
+  for (size_t i=0; i<offsets.size(); ++i) {
+    offsets_stable[i] = static_cast<int32_t>(offsets[i]);
+  }
+  
+  // Now create array and copy from stable vector
+  py::array_t<int32_t> offs({offs_size});
   auto O = offs.mutable_unchecked<1>();
-  // Explicitly copy each value individually - no views or references
-  for (ssize_t i=0; i<(ssize_t)offsets.size(); ++i) {
-    // Get value from vector (explicit copy)
-    int32_t val = static_cast<int32_t>(offsets[i]);
-    // Write to numpy array (explicit assignment)
-    O(i) = val;
-    // Verify the write succeeded (debug check)
-    if (i < 5 || i >= (ssize_t)offsets.size() - 5) {
-      std::cerr << "DEBUG: offs[" << i << "] = " << O(i) << " (from offsets[" << i << "] = " << offsets[i] << ")" << std::endl;
-    }
+  // Copy element by element to ensure each value is written
+  for (ssize_t i=0; i<offs_size; ++i) {
+    O(i) = offsets_stable[i];
+  }
+  
+  // Verify immediately after copy
+  std::cerr << "DEBUG: After copying from stable vector, verifying array:" << std::endl;
+  for (ssize_t i=0; i<std::min(5L, offs_size); ++i) {
+    int32_t val = O(i);
+    std::cerr << "  offs[" << i << "] = " << val << " (expected " << offsets_stable[i] << ")" << std::endl;
+  }
+  for (ssize_t i=std::max(0L, offs_size-5); i<offs_size; ++i) {
+    int32_t val = O(i);
+    std::cerr << "  offs[" << i << "] = " << val << " (expected " << offsets_stable[i] << ")" << std::endl;
   }
   py::array_t<float> scores({(ssize_t)final_scores.size()});
   auto Sarr = scores.mutable_unchecked<1>();
