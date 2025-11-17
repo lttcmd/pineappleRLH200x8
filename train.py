@@ -1116,6 +1116,8 @@ class SelfPlayTrainer:
                 # Verify reset worked correctly
                 if state.round != 0 or len(state.current_draw) != 5:
                     # Reset failed, skip this episode
+                    if eval_idx < 3:
+                        print(f"  Eval {eval_idx}: RESET FAILED - round={state.round}, draw_len={len(state.current_draw)}")
                     test_scores.append(0.0)
                     incomplete_boards += 1
                     continue
@@ -1128,6 +1130,9 @@ class SelfPlayTrainer:
                 while step_count < max_steps and not done:
                     legal_actions = env.legal_actions(state)
                     if not legal_actions:
+                        if eval_idx < 3:
+                            filled = sum(1 for s in state.board if s is not None)
+                            print(f"  Eval {eval_idx}: NO LEGAL ACTIONS at step {step_count}, filled={filled}/13, round={state.round}")
                         episode_states.append(state)
                         break
                     
@@ -1161,6 +1166,11 @@ class SelfPlayTrainer:
                 # Check if board was complete BEFORE scoring
                 # (score() returns 0.0 for incomplete boards, so we need to check first)
                 is_complete = all(slot is not None for slot in state.board)
+                filled_slots = sum(1 for slot in state.board if slot is not None)
+                
+                if eval_idx < 3:
+                    print(f"  Eval {eval_idx}: After {step_count} steps - filled={filled_slots}/13, round={state.round}, done={done}, complete={is_complete}")
+                
                 final_score = env.score(state)
                 test_scores.append(final_score)
                 
