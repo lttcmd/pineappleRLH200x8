@@ -647,29 +647,40 @@ py::tuple generate_random_episodes(uint64_t seed, int num_episodes) {
     offsets_stable[i] = static_cast<int32_t>(offsets[i]);
   }
   
-  // Create array and get raw pointer to data
-  py::array_t<int32_t> offs({offs_size});
-  py::buffer_info buf = offs.request();
-  int32_t* offs_ptr = static_cast<int32_t*>(buf.ptr);
+  // Create array with explicit memory ownership - CRITICAL for Linux
+  // Use py::array_t constructor that takes data pointer and makes a copy
+  // This ensures Python gets an owned array, not a view
+  py::array_t<int32_t> offs = py::cast(offsets_stable);
   
-  // Copy using raw pointer - this should avoid the mutable_unchecked bug
-  std::memcpy(offs_ptr, offsets_stable.data(), offs_size * sizeof(int32_t));
-  
-  // Verify immediately after memcpy
-  std::cerr << "DEBUG: After memcpy to raw pointer, verifying array:" << std::endl;
+  // Verify the array contents after cast
+  auto O_verify = offs.unchecked<1>();
+  std::cerr << "DEBUG: After py::cast, verifying array:" << std::endl;
   for (ssize_t i=0; i<std::min(5L, offs_size); ++i) {
-    int32_t val = offs_ptr[i];
+    int32_t val = O_verify(i);
     std::cerr << "  offs[" << i << "] = " << val << " (expected " << offsets_stable[i] << ")" << std::endl;
     if (val != offsets_stable[i]) {
       std::cerr << "ERROR: Mismatch at index " << i << "!" << std::endl;
     }
   }
   for (ssize_t i=std::max(0L, offs_size-5); i<offs_size; ++i) {
-    int32_t val = offs_ptr[i];
+    int32_t val = O_verify(i);
     std::cerr << "  offs[" << i << "] = " << val << " (expected " << offsets_stable[i] << ")" << std::endl;
     if (val != offsets_stable[i]) {
       std::cerr << "ERROR: Mismatch at index " << i << "!" << std::endl;
     }
+  }
+  
+  // Force Python to make a copy by accessing the array and ensuring it's not a view
+  // This is a workaround for pybind11 view issues on Linux
+  py::object offs_obj = offs;
+  py::object offs_copy = py::module_::import("numpy").attr("array")(offs_obj, py::arg("copy")=true, py::arg("dtype")="int32");
+  offs = offs_copy.cast<py::array_t<int32_t>>();
+  
+  std::cerr << "DEBUG: After forcing numpy copy, verifying array:" << std::endl;
+  auto O_final = offs.unchecked<1>();
+  for (ssize_t i=0; i<std::min(5L, offs_size); ++i) {
+    int32_t val = O_final(i);
+    std::cerr << "  offs[" << i << "] = " << val << " (expected " << offsets_stable[i] << ")" << std::endl;
   }
   py::array_t<float> scores({(ssize_t)final_scores.size()});
   auto Sarr = scores.mutable_unchecked<1>();
