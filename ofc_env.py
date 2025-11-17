@@ -107,6 +107,25 @@ class OfcEnv:
         )
         
         return state
+
+    def reset_two_boards(self) -> Tuple[State, State]:
+        """Reset and return two independent boards that share the same card sequence."""
+        deck = self._create_deck()
+        random.shuffle(deck)
+        deck_a = deck.copy()
+        deck_b = deck.copy()
+        return self._reset_with_deck(deck_a), self._reset_with_deck(deck_b)
+
+    def _reset_with_deck(self, deck: List[Card]) -> State:
+        draw = [deck.pop() for _ in range(5)]
+        board = [None] * 13
+        return State(
+            board=board,
+            round=0,
+            current_draw=draw,
+            deck=deck,
+            cards_placed_this_round=0
+        )
     
     def legal_actions(self, state: State) -> List[Action]:
         """
@@ -413,6 +432,15 @@ class OfcEnv:
             cards_placed_this_round=len(action.placements)
         ), 0.0, done
     
+    def step_two_boards(self, state_a: State, action_a: Action, state_b: State, action_b: Action) -> Tuple[State, State, bool]:
+        """
+        Apply actions to both boards and ensure they consume the same remaining deck.
+        """
+        next_a, _, done_a = self.step(state_a, action_a)
+        next_b, _, done_b = self.step(state_b, action_b)
+        assert len(next_a.deck) == len(next_b.deck), "Decks diverged between players"
+        return next_a, next_b, done_a and done_b
+
     def score(self, state: State) -> float:
         """
         Compute final OFC score for a completed board.
