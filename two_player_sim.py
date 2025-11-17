@@ -136,8 +136,11 @@ def run_benchmark(
     seed: Optional[int] = None,
 ) -> Dict[str, float]:
     rng = random.Random(seed)
-    policy_a = ValueNetPolicy(checkpoint_path, penalty=10.0) if checkpoint_path else RandomPolicy(rng)
-    policy_b = RandomPolicy(rng)
+    if checkpoint_path:
+        policy_a: Policy = ValueNetPolicy(checkpoint_path, penalty=10.0)
+    else:
+        policy_a = RandomPolicy(random.Random(rng.randint(0, 1 << 30)))
+    policy_b = RandomPolicy(random.Random(rng.randint(0, 1 << 30)))
 
     wins = 0
     losses = 0
