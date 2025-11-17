@@ -609,9 +609,14 @@ class SelfPlayTrainer:
         weights = []
         for sc in scores_all:
             w = 1.0
-            if sc < 0:
+            # Strongly prioritize positive-scoring (royalty) hands over neutral ones
+            if sc > 0:
+                w *= 3.0
+            # Still upweight fouls, but slightly less than big winners so we don't get stuck at neutral
+            elif sc < 0:
                 w *= 2.0
-            w *= (1.0 + min(1.0, abs(sc) / 10.0))
+            # Increase weight further with magnitude of outcome (big wins/losses > small ones)
+            w *= (1.0 + min(1.5, abs(sc) / 8.0))
             weights.append(w)
         # Normalize
         total_w = sum(weights) if weights else 1.0
