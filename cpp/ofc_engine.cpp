@@ -386,10 +386,10 @@ py::tuple engine_collect_encoded_episodes(uint64_t handle) {
       for (int k=0;k<838;++k) E(s,k) = eng->enc_all[idx++];
     }
   }
-  auto offs = py::array_t<int32_t>({(ssize_t)eng->episode_offsets.size()});
-  {
-    auto O = offs.mutable_unchecked<1>();
-    for (ssize_t i=0;i<(ssize_t)eng->episode_offsets.size();++i) O(i)=eng->episode_offsets[i];
+  // Return offsets as Python list to avoid pybind11 array bug on Linux
+  py::list offs_list;
+  for (size_t i=0; i<eng->episode_offsets.size(); ++i) {
+    offs_list.append(static_cast<int32_t>(eng->episode_offsets[i]));
   }
   auto scores = py::array_t<float>({(ssize_t)eng->final_scores.size()});
   {
@@ -401,7 +401,7 @@ py::tuple engine_collect_encoded_episodes(uint64_t handle) {
   eng->final_scores.clear();
   eng->episode_offsets.clear();
   eng->episode_offsets.push_back(0);
-  return py::make_tuple(enc, offs, scores);
+  return py::make_tuple(enc, offs_list, scores);
 }
 
 // Generate random episodes end-to-end and return encoded states
