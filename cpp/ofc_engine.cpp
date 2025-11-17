@@ -639,33 +639,46 @@ py::tuple generate_random_episodes(uint64_t seed, int num_episodes) {
     }
   }
   
-  // Create offsets array - WORKAROUND for Linux mutable_unchecked bug
-  // On Linux, mutable_unchecked has a bug where all writes go to same location
-  // Solution: Create array with explicit shape, then use buffer protocol to copy
+  // Create offsets array - FINAL FIX for Linux pybind11 return bug
+  // The array is correct in C++ but becomes zeros in Python on return
+  // Solution: Create array with data pointer and explicit ownership
   ssize_t offs_size = (ssize_t)offsets.size();
-  py::array_t<int32_t> offs({offs_size});
   
-  // Get the underlying buffer and copy data directly
-  // This bypasses mutable_unchecked which has the Linux bug
-  py::buffer_info buf = offs.request();
-  if (buf.ptr == nullptr) {
-    throw std::runtime_error("offsets array buffer pointer is null");
-  }
-  
-  // Copy data directly to buffer memory
-  int32_t* data_ptr = static_cast<int32_t*>(buf.ptr);
+  // Create a stable vector copy that will outlive the function
+  std::vector<int32_t> offsets_stable(offs_size);
   for (size_t i=0; i<offsets.size(); ++i) {
-    data_ptr[i] = static_cast<int32_t>(offsets[i]);
+    offsets_stable[i] = static_cast<int32_t>(offsets[i]);
   }
   
-  // Verify the copy worked by reading back through the buffer
-  std::cerr << "DEBUG: After direct buffer copy, verifying:" << std::endl;
+  // Create array using buffer protocol with explicit copy
+  // Use py::array_t constructor that takes shape and data, with copy semantics
+  py::array_t<int32_t> offs(
+    py::array::ShapeContainer{offs_size},
+    offsets_stable.data()
+  );
+  
+  // CRITICAL: The array created from data pointer is a VIEW
+  // We need to ensure it's copied. Use numpy's copy mechanism via Python
+  // But since we can't call Python from C++ easily, create a new array and copy
+  py::array_t<int32_t> offs_owned({offs_size});
+  {
+    py::buffer_info buf_owned = offs_owned.request();
+    int32_t* owned_ptr = static_cast<int32_t*>(buf_owned.ptr);
+    // Copy from stable vector to owned array
+    for (ssize_t i=0; i<offs_size; ++i) {
+      owned_ptr[i] = offsets_stable[i];
+    }
+  }
+  
+  // Verify owned array
+  auto O_verify = offs_owned.unchecked<1>();
+  std::cerr << "DEBUG: After creating owned array, verifying:" << std::endl;
   for (ssize_t i=0; i<std::min(5L, offs_size); ++i) {
-    std::cerr << "  data_ptr[" << i << "] = " << data_ptr[i] << " (expected " << offsets[i] << ")" << std::endl;
+    std::cerr << "  offs_owned[" << i << "] = " << O_verify(i) << " (expected " << offsets[i] << ")" << std::endl;
   }
-  for (ssize_t i=std::max(0L, offs_size-5); i<offs_size; ++i) {
-    std::cerr << "  data_ptr[" << i << "] = " << data_ptr[i] << " (expected " << offsets[i] << ")" << std::endl;
-  }
+  
+  // Return the owned array (not the view)
+  offs = std::move(offs_owned);
   py::array_t<float> scores({(ssize_t)final_scores.size()});
   auto Sarr = scores.mutable_unchecked<1>();
   for (ssize_t i=0;i<(ssize_t)final_scores.size();++i) Sarr(i)=final_scores[i];
