@@ -284,34 +284,15 @@ class SelfPlayTrainer:
         if use_random and _USE_CPP and _CPP is not None:
             encoded, offsets, scores_np = _CPP.generate_random_episodes(np.uint64(base_seed), int(num_episodes))
             encoded_np = np.array(encoded, copy=False)
-            # Use copy=True for offsets to ensure we get correct cumulative values
-            # (pybind11 arrays might have view issues where all elements point to same value)
-            offsets_np = np.array(offsets, copy=True).astype(np.int32)
+            # Offsets are now returned as Python list to avoid pybind11 array bug on Linux
+            # Convert list to numpy array (this is safe and works on both platforms)
+            offsets_np = np.array(offsets, dtype=np.int32)
             scores_np = np.array(scores_np, copy=False).astype(np.float32, copy=False)
-            
-            # WORKAROUND for Linux pybind11 bug: offsets array becomes all zeros or all same value
-            # Detect corruption and rebuild offsets from state count
-            num_episodes_returned = scores_np.shape[0]
-            if num_episodes_returned > 0 and offsets_np.shape[0] == num_episodes_returned + 1:
-                # Check if offsets are corrupted (all zeros or all same value)
-                if np.all(offsets_np == 0) or (len(np.unique(offsets_np)) == 1 and offsets_np[0] != 0):
-                    # Rebuild offsets from state count
-                    total_states = encoded_np.shape[0]
-                    if total_states > 0:
-                        states_per_ep = total_states // num_episodes_returned
-                        if states_per_ep == 0:
-                            states_per_ep = 1
-                        offsets_np = np.zeros(num_episodes_returned + 1, dtype=np.int32)
-                        cumulative = 0
-                        for e in range(num_episodes_returned):
-                            cumulative += states_per_ep
-                            offsets_np[e + 1] = cumulative
-                        # Ensure last offset equals total states exactly
-                        offsets_np[-1] = total_states
             
             # Convert to list of (state, score) tuples for compatibility
             # Note: states are pre-encoded, so we return encoded arrays
             all_data = []
+            num_episodes_returned = scores_np.shape[0]
             if num_episodes_returned == 0:
                 # No episodes generated, return empty list
                 return all_data

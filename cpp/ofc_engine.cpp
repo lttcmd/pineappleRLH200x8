@@ -639,26 +639,18 @@ py::tuple generate_random_episodes(uint64_t seed, int num_episodes) {
     }
   }
   
-  // Create offsets array - SIMPLIFIED: Just create owned array and copy directly
-  // Avoid any view creation - only work with owned arrays
-  ssize_t offs_size = (ssize_t)offsets.size();
-  py::array_t<int32_t> offs({offs_size});
-  
-  // Copy data directly using buffer pointer (this works in C++)
-  py::buffer_info buf = offs.request();
-  int32_t* data_ptr = static_cast<int32_t*>(buf.ptr);
+  // Create offsets array - PROPER FIX: Return as Python list to avoid pybind11 array bug
+  // pybind11 has a bug on Linux where int32_t arrays returned in tuples get corrupted
+  // Solution: Return as Python list, let Python convert to numpy array
+  py::list offs_list;
   for (size_t i=0; i<offsets.size(); ++i) {
-    data_ptr[i] = static_cast<int32_t>(offsets[i]);
+    offs_list.append(static_cast<int32_t>(offsets[i]));
   }
   
-  // The array should now be correct. The issue is it becomes zeros on return to Python.
-  // This suggests a pybind11 return mechanism bug on Linux.
-  // As a workaround, we'll handle this in Python by rebuilding offsets from state count
-  // if they're all zeros or all the same value.
   py::array_t<float> scores({(ssize_t)final_scores.size()});
   auto Sarr = scores.mutable_unchecked<1>();
   for (ssize_t i=0;i<(ssize_t)final_scores.size();++i) Sarr(i)=final_scores[i];
-  return py::make_tuple(encoded, offs, scores);
+  return py::make_tuple(encoded, offs_list, scores);
 }
 
 
