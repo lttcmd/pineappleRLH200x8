@@ -1113,7 +1113,7 @@ class SelfPlayTrainer:
                 env = OfcEnv()
                 state = env.reset()
                 episode_states = []
-                max_steps = 30
+                max_steps = 50  # Increased from 30 to allow more steps for completion
                 step_count = 0
                 
                 while step_count < max_steps:
@@ -1141,6 +1141,11 @@ class SelfPlayTrainer:
                     state, reward, done = env.step(state, action)
                     if done:
                         episode_states.append(state)
+                        break
+                    
+                    # Safety check: if board is complete, mark as done
+                    if all(slot is not None for slot in state.board):
+                        # Board is complete, force done
                         break
                 
                 # Check if board was complete BEFORE scoring
