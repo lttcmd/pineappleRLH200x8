@@ -217,9 +217,9 @@ class SelfPlayTrainer:
         self.random_phase_episodes = 5_000            # 100% random for first 5k hands (exploration)
         self.anneal_phase_episodes = 20_000           # linearly anneal next 20k hands (by 25k, mostly model-guided)
         self.min_random_prob = 0.15                   # keep 15% random thereafter (85% model-guided for strategy learning)
-        # Foul-aware selection penalty schedule
-        self.selection_penalty_start = 12.0
-        self.selection_penalty_final = 8.0
+        # Foul-aware selection penalty schedule (stronger penalty to push foul rate down)
+        self.selection_penalty_start = 16.0
+        self.selection_penalty_final = 10.0
         # EMA normalization for targets
         self.target_mean_ema = 0.0
         self.target_var_ema = 1.0
@@ -734,7 +734,8 @@ class SelfPlayTrainer:
                         round0_loss = torch.nn.functional.cross_entropy(logits_sel, target_labels)
         except Exception:
             pass
-        loss = value_loss + 5.0 * foul_loss + 0.5 * feas_loss + 0.2 * round0_loss
+        # Heavier weight on foul_loss to more strongly penalize fouled hands
+        loss = value_loss + 8.0 * foul_loss + 0.5 * feas_loss + 0.2 * round0_loss
         # Backward pass
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -968,17 +969,28 @@ class SelfPlayTrainer:
                         filled_before = sum(1 for s in state.board if s is not None)
                         print(f"    Step {step_count}: round={state.round}, filled={filled_before}/13, legal_actions={len(legal_actions)}")
                     
-                    # Use value network to choose action
-                    from action_selection import choose_best_action_with_value_net
-                    action = choose_best_action_with_value_net(
-                        state=state,
-                        legal_actions=legal_actions,
-                        model=self.model,
-                        env=env,
-                        device=self.device
-                    )
-                    if action is None:
-                        # Fallback to random if model fails
+                    # Use foul-aware value network policy to choose action
+                    try:
+                        # Simulate all candidate next states
+                        candidate_states = []
+                        candidate_actions = []
+                        for a in legal_actions:
+                            next_state, _, _ = env.step(state, a)
+                            candidate_states.append(next_state)
+                            candidate_actions.append(a)
+
+                        # Encode and evaluate on current device
+                        encoded_batch = encode_state_batch(candidate_states).to(self.device)
+                        with torch.no_grad():
+                            values, foul_logit, _, _ = self.model(encoded_batch)
+                            values = values.squeeze()
+                            foul_prob = torch.sigmoid(foul_logit).squeeze()
+                            penalty = self.selection_penalty_final
+                            combined = values - penalty * foul_prob
+                            best_idx = int(combined.argmax().item())
+                        action = candidate_actions[best_idx]
+                    except Exception:
+                        # Fallback to random if anything goes wrong
                         action = legal_actions[random.randint(0, len(legal_actions) - 1)]
                     
                     # Debug action chosen
