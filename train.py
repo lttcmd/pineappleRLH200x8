@@ -218,8 +218,8 @@ class SelfPlayTrainer:
         self.anneal_phase_episodes = 20_000           # linearly anneal next 20k hands (by 25k, mostly model-guided)
         self.min_random_prob = 0.15                   # keep 15% random thereafter (85% model-guided for strategy learning)
         # Foul-aware selection penalty schedule (stronger penalty to push foul rate down)
-        self.selection_penalty_start = 16.0
-        self.selection_penalty_final = 10.0
+        self.selection_penalty_start = 20.0
+        self.selection_penalty_final = 12.0
         # EMA normalization for targets
         self.target_mean_ema = 0.0
         self.target_var_ema = 1.0
@@ -611,12 +611,12 @@ class SelfPlayTrainer:
             w = 1.0
             # Strongly prioritize positive-scoring (royalty) hands over neutral ones
             if sc > 0:
-                w *= 3.0
+                w *= 4.0
             # Still upweight fouls, but slightly less than big winners so we don't get stuck at neutral
             elif sc < 0:
-                w *= 2.0
+                w *= 2.5
             # Increase weight further with magnitude of outcome (big wins/losses > small ones)
-            w *= (1.0 + min(1.5, abs(sc) / 8.0))
+            w *= (1.0 + min(2.0, abs(sc) / 6.0))
             weights.append(w)
         # Normalize
         total_w = sum(weights) if weights else 1.0
@@ -740,7 +740,7 @@ class SelfPlayTrainer:
         except Exception:
             pass
         # Heavier weight on foul_loss to more strongly penalize fouled hands
-        loss = value_loss + 8.0 * foul_loss + 0.5 * feas_loss + 0.2 * round0_loss
+        loss = value_loss + 10.0 * foul_loss + 0.5 * feas_loss + 0.2 * round0_loss
         # Backward pass
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
