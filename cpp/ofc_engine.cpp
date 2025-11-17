@@ -617,7 +617,8 @@ py::tuple generate_random_episodes(uint64_t seed, int num_episodes) {
       // Ensure last offset equals total state count exactly
       offsets.back() = state_count;
       std::cerr << "Rebuilt offsets: first 5 = ";
-      for (size_t i = 0; i < std::min(5UL, offsets.size()); ++i) {
+      const size_t limit = std::min<size_t>(5, offsets.size());
+      for (size_t i = 0; i < limit; ++i) {
         std::cerr << offsets[i] << " ";
       }
       std::cerr << ", last = " << offsets.back() << std::endl;
