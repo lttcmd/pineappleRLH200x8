@@ -175,13 +175,13 @@ def main():
     elapsed = time.time() - start_time
     print(f"\nFoul pretraining complete in {elapsed/60:.1f} minutes.")
 
-    # Save foul-pretrained weights
-    torch.save(model.state_dict(), "value_net_foul_pretrain.pth")
-    print("Saved foul-pretrained weights to value_net_foul_pretrain.pth")
+    # Save foul-pretrained weights under simple_ prefix to avoid clashing with main training
+    torch.save(model.state_dict(), "simple_value_net_foul_pretrain.pth")
+    print("Saved foul-pretrained weights to simple_value_net_foul_pretrain.pth")
 
-    # Also save as an RL-style checkpoint so train.py can resume from episode 0
-    torch.save(model.state_dict(), "value_net_checkpoint_ep0.pth")
-    print("Saved RL checkpoint at episode 0 to value_net_checkpoint_ep0.pth")
+    # Also save as a checkpoint with simple_ prefix (episode 0 equivalent)
+    torch.save(model.state_dict(), "simple_value_net_checkpoint_ep0.pth")
+    print("Saved simple RL checkpoint at episode 0 to simple_value_net_checkpoint_ep0.pth")
 
 
 if __name__ == "__main__":
