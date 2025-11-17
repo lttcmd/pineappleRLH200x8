@@ -145,7 +145,13 @@ def test_cpp_parallel_workers():
         
         assert len(scores) == num_episodes, f"Should generate {num_episodes} episodes"
         assert encoded.shape[0] > 0, "Should have encoded states"
-        assert offsets.shape[0] == num_episodes + 1, "Should have correct offsets"
+        # Offsets may be a list (new code) or array (old code)
+        if isinstance(offsets, (list, tuple)):
+            assert len(offsets) == num_episodes + 1, f"Should have correct offsets length, got {len(offsets)}"
+            offsets_np = np.array(offsets, dtype=np.int32)
+        else:
+            assert offsets.shape[0] == num_episodes + 1, "Should have correct offsets"
+            offsets_np = np.array(offsets, dtype=np.int32)
         
         episodes_per_sec = num_episodes / elapsed
         print(f"  ✓ Generated {num_episodes} episodes in {elapsed:.2f}s ({episodes_per_sec:.1f} eps/s)")
