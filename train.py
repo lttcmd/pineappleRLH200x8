@@ -1110,8 +1110,8 @@ def main():
     )
     
     try:
-        # Train for 100,000 hands with checkpoints and evaluation every 25k
-        num_episodes = 10_000_000
+        # Train for 20,000,000 hands with checkpoints and evaluation every 25k
+        num_episodes = 20_000_000
         
         trainer.train(
             num_episodes=num_episodes,
