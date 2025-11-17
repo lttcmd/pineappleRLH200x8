@@ -331,6 +331,22 @@ class OfcEnv:
             new_board = [int_to_card(int(v)) if int(v) >= 0 else None for v in b2.tolist()]
             next_draw = [int_to_card(int(v)) for v in d2.tolist() if int(v) >= 0]
             new_deck = [int_to_card(int(v)) for v in deck2.tolist()]
+            
+            # Debug: Check if C++ actually placed cards (only in evaluation context)
+            import inspect
+            frame = inspect.currentframe()
+            try:
+                # Check if we're in evaluation by looking at the call stack
+                caller_frame = frame.f_back
+                if caller_frame and 'eval_idx' in str(caller_frame.f_locals):
+                    filled_count = sum(1 for c in new_board if c is not None)
+                    if filled_count == 0 and len(action.placements) > 0:
+                        # C++ returned empty board but action had placements - this is a bug!
+                        import sys
+                        print(f"  ERROR: C++ step returned empty board! b2={b2.tolist()[:5]}..., placements={len(action.placements)}", file=sys.stderr)
+            finally:
+                del frame
+            
             new_state = State(
                 board=new_board,
                 round=new_round,
