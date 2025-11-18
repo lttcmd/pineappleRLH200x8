@@ -5,6 +5,7 @@ set(SRC
   ofc_actions.cpp
   ofc_encode.cpp
   ofc_engine.cpp
+  sfl_policy.cpp
 )
 
 # Require C++20 for designated initializers used in Rules.hpp
