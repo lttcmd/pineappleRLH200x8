@@ -2,6 +2,8 @@
 #include <pybind11/numpy.h>
 #include <utility>
 
+#include "sfl_policy.h"
+
 namespace py = pybind11;
 
 // Forward decl from ofc_score.cpp
@@ -31,6 +33,7 @@ py::array_t<float> encode_state_batch_ints(py::array_t<int16_t> boards,  // (N,1
                                            py::array_t<int16_t> deck_sizes); // (N,)
 // Episode generator
 py::tuple generate_random_episodes(uint64_t seed, int num_episodes);
+py::tuple generate_sfl_dataset(uint64_t seed, int num_examples);
 // Engine APIs
 uint64_t create_engine(uint64_t seed);
 void destroy_engine(uint64_t handle);
@@ -66,6 +69,12 @@ PYBIND11_MODULE(ofc_cpp, m) {
   m.def("generate_random_episodes", &generate_random_episodes,
         py::arg("seed"), py::arg("num_episodes"),
         "Generate random episodes end-to-end and return (encoded_states [S,838], episode_offsets [E+1], final_scores [E]).");
+  m.def("sfl_choose_action", &sfl_choose_action,
+        py::arg("board"), py::arg("round_idx"), py::arg("current_draw"), py::arg("deck"),
+        "Choose best action index via native SFL heuristic. Returns candidate index in legal action list.");
+  m.def("generate_sfl_dataset", &generate_sfl_dataset,
+        py::arg("seed"), py::arg("num_examples"),
+        "Generate a dataset of encoded states and SFL-chosen action indices.");
 
   // Engine bindings
   m.def("create_engine", &create_engine, py::arg("seed"),
