@@ -7,6 +7,8 @@
 #include <set>
 #include <vector>
 
+#include "Rules.hpp"
+
 namespace py = pybind11;
 
 static inline int rank_from_int(int c) { return (c / 4) + 2; }   // 2..14
@@ -160,7 +162,10 @@ std::pair<float, bool> score_board_from_ints(py::array_t<int16_t> bottom,
   for (int i=0;i<5;++i){ mr[i]=rank_from_int(m(i)); ms[i]=suit_from_int(m(i)); }
   for (int i=0;i<3;++i){ tr[i]=rank_from_int(t(i)); }
   bool valid = validate_board(br,bs,mr,ms,tr);
-  if (!valid) return {-3.0f, true};
+  if (!valid) {
+    // Use canonical foul penalty from Rules.hpp so Python and C++ stay in sync.
+    return { -static_cast<float>(ofc::rules::FOUL_PENALTY), true };
+  }
   int roy = royalties_five(br,bs,false) + royalties_five(mr,ms,true) + std::max(top_pair_royalty(tr), top_trips_royalty(tr));
   return {static_cast<float>(roy), false};
 }

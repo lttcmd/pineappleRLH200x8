@@ -130,7 +130,8 @@ def train_policy_net(
 
     model = PolicyNet().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    scaler = torch.amp.GradScaler(device_type=device.type, enabled=use_amp and device.type == "cuda")
+    # Use CUDA GradScaler for broad PyTorch compatibility
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp and device.type == "cuda")
     accum = max(1, grad_accum_steps)
 
     loader_kwargs = dict(

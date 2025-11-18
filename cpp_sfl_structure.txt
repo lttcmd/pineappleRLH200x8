@@ -1,0 +1,46 @@
+## Files to add under cpp/ (or existing C++ source directory)
+1. `cpp/sfl_policy.h` / `cpp/sfl_policy.cpp`
+   - Implements the SFL scoring logic as C++ functions.
+   - Exposes `int choose_sfl_action(const EncodedState& state)` returning action index.
+   - Uses same slot layout and heuristics as Python `SFLPolicy` (row strengths, penalties, draw bonuses).
+
+2. `cpp/ismcts.h` / `cpp/ismcts.cpp`
+   - Implements ISMCTS nodes with selection/expansion/simulation/backprop.
+   - Relies on existing functions such as `step_state`, `legal_actions`.
+   - Rollouts call the native SFL helper.
+
+3. `cpp/bindings_ismcts.cpp` (or extend existing pybind file)
+   - Adds bindings:
+     - `py::object sfl_choose_action(py::bytes state_bytes)`
+     - `py::object ismcts_choose_action(py::bytes state_bytes, int iterations, double exploration)`
+   - Handles conversion between Python State and C++ `EncodedState`.
+
+## Key steps to integrate
+1. **C++ SFL helper**
+   - Mirror the heuristic from `sfl_policy.py`.
+   - Functions to compute row strength, flush/straight potential, etc.
+   - Provide `choose_sfl_action` returning the best action index for a given state.
+
+2. **ISMCTS in C++**
+   - Node struct: state snapshot (or seed + history), parent pointer, children vector, visit count, total reward.
+   - Selection uses UCT with exploration constant.
+   - Expansion pops untried actions.
+   - Simulation uses the native SFL helper to finish the board.
+   - Backprop updates visits/reward.
+
+3. **Bindings**
+   - Extend pybind11 module (`py_ofc.cpp` or equivalent) with wrappers that:
+     - Accept a Python `State` (convert to bytes/struct).
+     - Call `choose_sfl_action` or `ismcts_choose_action`.
+     - Return the chosen action in a form Python can wrap into `Action`.
+
+4. **Python integration**
+   - Add helper functions in Python `ofc_cpp` wrapper:
+     - `ofc_cpp.sfl_choose_action(state)` etc.
+   - Update `collect_heuristic_dataset.py`, `two_player_sim.py`, `evaluate_ismcts.py` to use the bindings when flags indicate C++ mode.
+
+5. **Testing**
+   - Unit tests comparing Python vs C++ SFL output on sample states.
+   - Benchmark data collection speed before/after.
+
+

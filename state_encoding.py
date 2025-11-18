@@ -12,6 +12,7 @@ if _USE_CPP:
         import ofc_cpp as _CPP
     except Exception:
         _CPP = None
+from typing import Any, Optional
 from ofc_env import State
 from ofc_types import Card
 
@@ -50,7 +51,11 @@ def encode_state(state: State) -> torch.Tensor:
     return encoded
 
 
-def encode_state_batch(states) -> torch.Tensor:
+def encode_state_batch(states,
+                       boards: Optional[np.ndarray] = None,
+                       rounds: Optional[np.ndarray] = None,
+                       draws: Optional[np.ndarray] = None,
+                       deck_sizes: Optional[np.ndarray] = None) -> torch.Tensor:
     """
     Encode multiple states at once for better performance.
     Ultra-optimized with numpy for speed.
@@ -63,10 +68,14 @@ def encode_state_batch(states) -> torch.Tensor:
     """
     batch_size = len(states)
     if _CPP is not None:
-        boards = np.full((batch_size, 13), -1, dtype=np.int16)
-        rounds = np.zeros((batch_size,), dtype=np.int8)
-        draws = np.full((batch_size, 3), -1, dtype=np.int16)
-        deck_sizes = np.zeros((batch_size,), dtype=np.int16)
+        if boards is None:
+            boards = np.full((batch_size, 13), -1, dtype=np.int16)
+        if rounds is None:
+            rounds = np.zeros((batch_size,), dtype=np.int8)
+        if draws is None:
+            draws = np.full((batch_size, 3), -1, dtype=np.int16)
+        if deck_sizes is None:
+            deck_sizes = np.zeros((batch_size,), dtype=np.int16)
         for idx, state in enumerate(states):
             for i in range(13):
                 if state.board[i] is not None:
