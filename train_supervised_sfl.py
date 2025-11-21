@@ -214,6 +214,10 @@ def train_supervised(
     # This is complex, so for now we'll just use the same offsets (slightly inefficient but works)
     print(f"[train_supervised] Train: {num_train}, Val: {num_val}")
     
+    # Create data loaders
+    train_loader = create_data_loader(train_states, train_labels, action_offsets, action_encodings, batch_size, shuffle=True, device=device, num_workers=num_workers)
+    val_loader = create_data_loader(val_states, val_labels, action_offsets, action_encodings, batch_size, shuffle=False, device=device, num_workers=num_workers)
+    
     # Model
     model = RLPolicyNet().to(device)
     model.train()
