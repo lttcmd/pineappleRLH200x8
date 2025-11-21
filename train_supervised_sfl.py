@@ -19,9 +19,14 @@ from tqdm import tqdm
 from rl_policy_net import RLPolicyNet
 
 
-def load_sfl_dataset(data_dir: str, max_shards: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def load_sfl_dataset(data_dir: str, max_shards: Optional[int] = None, start_shard: int = 0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Load SFL dataset from shard files.
+    
+    Args:
+        data_dir: Directory containing shard files
+        max_shards: Maximum number of shards to load (None = all)
+        start_shard: Index of first shard to load (0 = start from beginning)
     
     Returns:
         states: (N, 838) tensor of state encodings
@@ -32,6 +37,11 @@ def load_sfl_dataset(data_dir: str, max_shards: Optional[int] = None) -> Tuple[t
     data_path = Path(data_dir)
     shard_files = sorted(data_path.glob("shard_*.pt"))
     
+    # Apply start_shard offset
+    if start_shard > 0:
+        shard_files = shard_files[start_shard:]
+    
+    # Apply max_shards limit
     if max_shards:
         shard_files = shard_files[:max_shards]
     
@@ -285,6 +295,7 @@ def train_supervised(
     device: torch.device,
     seed: int,
     max_shards: Optional[int] = None,
+    start_shard: int = 0,
     val_split: float = 0.1,
     num_workers: int = 8,
     checkpoint_path: Optional[str] = None,
@@ -300,7 +311,7 @@ def train_supervised(
         torch.cuda.manual_seed_all(seed)
     
     # Load dataset
-    states, labels, action_offsets, action_encodings = load_sfl_dataset(data_dir, max_shards)
+    states, labels, action_offsets, action_encodings = load_sfl_dataset(data_dir, max_shards, start_shard)
     
     # Keep everything on CPU for DataLoader workers (they can't access CUDA tensors)
     # We'll move batches to GPU in the training loop
@@ -501,6 +512,12 @@ def main():
         help="Maximum number of shards to load (for testing).",
     )
     parser.add_argument(
+        "--start-shard",
+        type=int,
+        default=0,
+        help="Index of first shard to load (0 = start from beginning).",
+    )
+    parser.add_argument(
         "--val-split",
         type=float,
         default=0.1,
@@ -532,6 +549,7 @@ def main():
         device=device,
         seed=args.seed,
         max_shards=args.max_shards,
+        start_shard=args.start_shard,
         val_split=args.val_split,
         num_workers=args.num_workers,
         checkpoint_path=args.checkpoint,
