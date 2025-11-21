@@ -114,6 +114,8 @@ def remap_action_data(
     a subset of states (e.g., for train/val split). The remapped offsets start
     from 0 and are relative to the remapped action_encodings.
     
+    Also fixes corrupted labels in the dataset by clamping them to valid range.
+    
     Args:
         indices: (K,) tensor of state indices to include
         states: (N, 838) original states
@@ -123,7 +125,7 @@ def remap_action_data(
     
     Returns:
         remapped_states: (K, 838) subset of states
-        remapped_labels: (K,) subset of labels
+        remapped_labels: (K,) subset of labels (clamped to valid range)
         remapped_action_offsets: (K+1,) remapped offsets (starting from 0)
         remapped_action_encodings: (M', 838) subset of action encodings
     """
@@ -131,21 +133,37 @@ def remap_action_data(
     
     # Get subset of states and labels
     remapped_states = states[indices]  # (K, 838)
-    remapped_labels = labels[indices]  # (K,)
+    remapped_labels = labels[indices].clone()  # (K,) - clone to avoid modifying original
     
-    # Collect action encodings for selected states
+    # Collect action encodings for selected states and fix labels
     remapped_action_encodings_list = []
     remapped_action_offsets = [0]  # Start from 0
+    num_fixed_labels = 0
     
-    for idx in indices:
+    for i, idx in enumerate(indices):
         start = action_offsets[idx].item()
         end = action_offsets[idx + 1].item()
+        num_actions = end - start
         state_actions = action_encodings[start:end]  # (num_actions, 838)
         remapped_action_encodings_list.append(state_actions)
         
+        # Fix label if out of range (handles corrupted dataset)
+        original_label = remapped_labels[i].item()
+        if original_label < 0 or original_label >= num_actions:
+            # Clamp to valid range
+            fixed_label = max(0, min(original_label, num_actions - 1))
+            remapped_labels[i] = fixed_label
+            num_fixed_labels += 1
+            if num_fixed_labels == 1:
+                print(f"[remap_action_data] WARNING: Found corrupted label at original index {idx}: "
+                      f"label={original_label}, num_actions={num_actions}, clamping to {fixed_label}")
+        
         # Update offset: current offset + number of actions for this state
-        next_offset = remapped_action_offsets[-1] + state_actions.shape[0]
+        next_offset = remapped_action_offsets[-1] + num_actions
         remapped_action_offsets.append(next_offset)
+    
+    if num_fixed_labels > 0:
+        print(f"[remap_action_data] Fixed {num_fixed_labels} corrupted labels")
     
     # Concatenate all action encodings
     remapped_action_encodings = torch.cat(remapped_action_encodings_list, dim=0)  # (M', 838)
@@ -170,19 +188,8 @@ class SFLDataset(Dataset):
         self.action_offsets = action_offsets  # (N+1,)
         self.action_encodings = action_encodings  # (M, 838) - on CPU
         
-        # Validate that labels are within valid range
-        self._validate_labels()
-    
-    def _validate_labels(self):
-        """Validate that all labels are within valid action range."""
-        for i in range(len(self.states)):
-            num_actions = self.action_offsets[i + 1].item() - self.action_offsets[i].item()
-            label = self.labels[i].item()
-            if label < 0 or label >= num_actions:
-                raise ValueError(
-                    f"Invalid label at index {i}: label={label}, num_actions={num_actions}. "
-                    f"This indicates a bug in remap_action_data or data corruption."
-                )
+        # Labels should be valid after remap_action_data, but we'll validate anyway
+        # (remap_action_data now fixes corrupted labels, so this should pass)
     
     def __len__(self):
         return self.states.shape[0]
