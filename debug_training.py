@@ -21,8 +21,19 @@ states, labels, action_offsets, action_encodings = load_sfl_dataset(
 )
 print(f"   Loaded {len(states)} states")
 
-# Take a small subset
-indices = torch.arange(min(1000, len(states)), dtype=torch.long)
+# Check original labels BEFORE remapping
+print("\n1.5. Checking ORIGINAL labels (before remapping)...")
+unique_orig, counts_orig = torch.unique(labels[:10000], return_counts=True)
+print(f"   First 10000 states - Unique labels: {len(unique_orig)}")
+print(f"   Label distribution (first 10):")
+for label, count in zip(unique_orig[:10], counts_orig[:10]):
+    print(f"     Label {label}: {count} ({count/10000*100:.1f}%)")
+
+# Take a RANDOM subset (not first 1000)
+import random
+random.seed(42)
+sample_size = min(1000, len(states))
+indices = torch.tensor(random.sample(range(len(states)), sample_size), dtype=torch.long)
 train_states, train_labels, train_action_offsets, train_action_encodings = remap_action_data(
     indices, states, labels, action_offsets, action_encodings
 )
