@@ -11,6 +11,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 from rl_policy_net import RLPolicyNet
@@ -93,60 +94,75 @@ def load_sfl_dataset(data_dir: str, max_shards: Optional[int] = None):
     return states_tensor, labels_tensor, action_offsets_tensor, action_encodings_tensor
 
 
-def create_data_loader(states, labels, action_offsets, action_encodings, batch_size, device, shuffle=True):
-    """
-    Create a data loader that yields batches of (state, action_encodings, label).
-    """
-    num_samples = states.shape[0]
-    indices = list(range(num_samples))
+class SFLDataset(Dataset):
+    """Dataset for SFL training data."""
+    def __init__(self, states, labels, action_offsets, action_encodings):
+        self.states = states  # (N, 838) - on CPU
+        self.labels = labels  # (N,)
+        self.action_offsets = action_offsets  # (N+1,)
+        self.action_encodings = action_encodings  # (M, 838) - on CPU
     
-    if shuffle:
-        random.shuffle(indices)
+    def __len__(self):
+        return self.states.shape[0]
     
-    for i in range(0, num_samples, batch_size):
-        batch_indices = indices[i:i+batch_size]
-        batch_states = states[batch_indices]  # (B, 838)
-        batch_labels = labels[batch_indices]  # (B,)
+    def __getitem__(self, idx):
+        start = self.action_offsets[idx].item()
+        end = self.action_offsets[idx + 1].item()
+        state_actions = self.action_encodings[start:end]  # (num_actions, 838)
         
-        # Get action encodings for each state in batch
-        batch_action_encodings = []
-        batch_action_counts = []
+        return {
+            'state': self.states[idx],
+            'actions': state_actions,
+            'label': self.labels[idx],
+            'num_actions': state_actions.shape[0]
+        }
+
+
+def collate_fn(batch):
+    """Collate function to pad actions to same length."""
+    states = torch.stack([item['state'] for item in batch], dim=0)  # (B, 838)
+    labels = torch.stack([torch.tensor(item['label']) for item in batch], dim=0)  # (B,)
+    action_encodings = [item['actions'] for item in batch]
+    action_counts = [item['num_actions'] for item in batch]
+    
+    # Pad to same length (max actions in batch)
+    max_actions = max(action_counts)
+    padded_actions = []
+    valid_mask = []
+    
+    for actions, num_actions in zip(action_encodings, action_counts):
+        # Pad with zeros
+        if num_actions < max_actions:
+            padding = torch.zeros(max_actions - num_actions, 838, dtype=actions.dtype)
+            actions = torch.cat([actions, padding], dim=0)
+        padded_actions.append(actions)
         
-        for idx in batch_indices:
-            start = action_offsets[idx].item()
-            end = action_offsets[idx + 1].item()
-            state_actions = action_encodings[start:end]  # (num_actions, 838)
-            # Move to device only when needed
-            state_actions = state_actions.to(device)
-            batch_action_encodings.append(state_actions)
-            batch_action_counts.append(state_actions.shape[0])
-        
-        # Pad to same length (max actions in batch)
-        max_actions = max(batch_action_counts)
-        padded_actions = []
-        valid_mask = []
-        
-        for j, actions in enumerate(batch_action_encodings):
-            num_actions = actions.shape[0]
-            action_device = actions.device
-            # Pad with zeros (on same device)
-            if num_actions < max_actions:
-                padding = torch.zeros(max_actions - num_actions, 838, dtype=actions.dtype, device=action_device)
-                actions = torch.cat([actions, padding], dim=0)
-            padded_actions.append(actions)
-            
-            # Create mask: 1 for valid actions, 0 for padding (on same device)
-            mask = torch.zeros(max_actions, dtype=torch.bool, device=action_device)
-            mask[:num_actions] = True
-            valid_mask.append(mask)
-        
-        batch_action_enc = torch.stack(padded_actions, dim=0)  # (B, max_actions, 838)
-        batch_valid_mask = torch.stack(valid_mask, dim=0)  # (B, max_actions)
-        
-        # Adjust labels to account for padding (labels should be < num_actions for each state)
-        # Labels are already correct, we just need to mask invalid actions
-        
-        yield batch_states, batch_action_enc, batch_labels, batch_valid_mask, batch_action_counts
+        # Create mask: 1 for valid actions, 0 for padding
+        mask = torch.zeros(max_actions, dtype=torch.bool)
+        mask[:num_actions] = True
+        valid_mask.append(mask)
+    
+    batch_action_enc = torch.stack(padded_actions, dim=0)  # (B, max_actions, 838)
+    batch_valid_mask = torch.stack(valid_mask, dim=0)  # (B, max_actions)
+    
+    return states, batch_action_enc, labels, batch_valid_mask, action_counts
+
+
+def create_data_loader(states, labels, action_offsets, action_encodings, batch_size, device, shuffle=True, num_workers=4):
+    """
+    Create a multi-threaded data loader.
+    """
+    dataset = SFLDataset(states, labels, action_offsets, action_encodings)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=True if device.type == 'cuda' else False,
+        collate_fn=collate_fn,
+        persistent_workers=True if num_workers > 0 else False,
+    )
+    return loader
 
 
 def train_supervised(
@@ -159,6 +175,7 @@ def train_supervised(
     seed: int,
     max_shards: Optional[int] = None,
     val_split: float = 0.1,
+    num_workers: int = 8,
 ):
     """
     Train policy network to imitate SFL using supervised learning.
@@ -216,6 +233,11 @@ def train_supervised(
         )
         
         for batch_states, batch_action_enc, batch_labels, batch_valid_mask, batch_action_counts in pbar:
+        # Move to device (DataLoader returns CPU tensors)
+        batch_states = batch_states.to(device)
+        batch_action_enc = batch_action_enc.to(device)
+        batch_labels = batch_labels.to(device)
+        batch_valid_mask = batch_valid_mask.to(device)
             batch_size_actual = batch_states.shape[0]
             
             # Get scores for all actions
