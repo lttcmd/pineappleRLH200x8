@@ -22,21 +22,29 @@ class RLPolicyNet(nn.Module):
     - Action scorer: (state_embedding, action_encoding) -> score
     """
     
-    def __init__(self, state_dim: int = 838, hidden_dim: int = 256):
+    def __init__(self, state_dim: int = 838, hidden_dim: int = 512):
         super().__init__()
-        # State embedding network
+        # State embedding network - larger and deeper
         self.state_net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
         )
         
         # Action scoring: concatenate state embedding with action encoding
+        # Larger network to handle variable action spaces
         self.action_net = nn.Sequential(
             nn.Linear(hidden_dim // 2 + state_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
         )
     
     def forward(self, state_enc: torch.Tensor, action_enc: torch.Tensor) -> torch.Tensor:

@@ -367,7 +367,7 @@ def train_supervised(
             print(f"[train_supervised] Warning: Failed to load checkpoint: {e}")
             print(f"[train_supervised] Starting from scratch")
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     
     # Training loop
     for epoch in range(epochs):
