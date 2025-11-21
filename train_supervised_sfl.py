@@ -255,20 +255,18 @@ def train_supervised(
             if (valid_actions_per_sample == 0).any():
                 # Skip this batch if any sample has no valid actions
                 num_batches_skipped += 1
+                if num_batches_skipped == 1:
+                    print(f"[DEBUG] First skip: sample with 0 valid actions")
                 continue
             
-            # Validate labels are within valid action range
-            max_valid_actions = valid_actions_per_sample.max().item()
-            if (batch_labels >= max_valid_actions).any():
-                # Labels out of range - skip this batch
-                num_batches_skipped += 1
-                continue
-            
-            # Also check labels are within each sample's valid range
+            # Validate labels are within each sample's valid range
             labels_valid = batch_labels < valid_actions_per_sample
             if not labels_valid.all():
                 # Some labels are out of range for their specific sample
                 num_batches_skipped += 1
+                if num_batches_skipped == 1:
+                    invalid_idx = (~labels_valid).nonzero()[0].item()
+                    print(f"[DEBUG] First skip: label {batch_labels[invalid_idx].item()} >= num_actions {valid_actions_per_sample[invalid_idx].item()}")
                 continue
             
             # Compute loss
