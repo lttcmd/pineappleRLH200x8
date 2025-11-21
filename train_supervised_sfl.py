@@ -227,6 +227,8 @@ def train_supervised(
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
+        num_batches_processed = 0
+        num_batches_skipped = 0
         
         pbar = tqdm(
             train_loader,
@@ -252,6 +254,7 @@ def train_supervised(
             valid_actions_per_sample = batch_valid_mask.sum(dim=1)  # (B,)
             if (valid_actions_per_sample == 0).any():
                 # Skip this batch if any sample has no valid actions
+                num_batches_skipped += 1
                 continue
             
             # Compute loss
@@ -259,7 +262,10 @@ def train_supervised(
             
             # Check for inf/nan
             if not torch.isfinite(loss):
+                num_batches_skipped += 1
                 continue
+            
+            num_batches_processed += 1
             
             # Compute accuracy
             preds = scores.argmax(dim=-1)
@@ -279,8 +285,11 @@ def train_supervised(
                 "acc": f"{100*correct/batch_size_actual:.2f}%",
             })
         
-        avg_loss = total_loss / max(1, len(train_loader)) if len(train_loader) > 0 else 0.0
+        avg_loss = total_loss / max(1, num_batches_processed)
         train_acc = 100.0 * total_correct / max(1, total_samples)
+        
+        if num_batches_skipped > 0:
+            print(f"[Epoch {epoch+1}] WARNING: Skipped {num_batches_skipped} batches (inf/nan loss or no valid actions)")
         
         # Validation
         model.eval()
