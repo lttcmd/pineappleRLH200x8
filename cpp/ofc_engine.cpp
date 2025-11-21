@@ -35,7 +35,7 @@ std::pair<float,bool> score_board_from_ints(py::array_t<int16_t> bottom,
                                             py::array_t<int16_t> middle,
                                             py::array_t<int16_t> top);
 py::array_t<float> encode_state_batch_ints(py::array_t<int16_t> boards,
-                                           py::array_t<int8_t> rounds,
+                                           py::array_t<int16_t> rounds,
                                            py::array_t<int16_t> draws,
                                            py::array_t<int16_t> deck_sizes);
 
@@ -225,7 +225,7 @@ py::tuple request_policy_batch(uint64_t handle, int max_candidates_per_env) {
     return py::make_tuple(enc, meta_np);
   }
   py::array_t<int16_t> boards_np({T, (ssize_t)13});
-  py::array_t<int8_t> rounds_np({T});
+  py::array_t<int16_t> rounds_np(py::array::ShapeContainer{(ssize_t)T});
   py::array_t<int16_t> draws_np({T, (ssize_t)3});
   py::array_t<int16_t> deck_np({T});
   {
@@ -332,7 +332,7 @@ int apply_policy_actions(uint64_t handle, py::array_t<int32_t> chosen) {
     auto boards_np = py::array_t<int16_t>(py::array::ShapeContainer{(ssize_t)1, (ssize_t)13});
     auto B = boards_np.mutable_unchecked<2>();
     for (int j=0;j<13;++j) B(0,j) = st.board[j];
-    auto rounds_np = py::array_t<int8_t>(py::array::ShapeContainer{(ssize_t)1});
+    auto rounds_np = py::array_t<int16_t>(py::array::ShapeContainer{(ssize_t)1});
     auto R = rounds_np.mutable_unchecked<1>();
     R(0) = (int8_t)st.round_idx;
     auto draws_np = py::array_t<int16_t>(py::array::ShapeContainer{(ssize_t)1, (ssize_t)3});
@@ -544,7 +544,7 @@ py::tuple generate_random_episodes(uint64_t seed, int num_episodes) {
   // Offsets are already correctly built as cumulative values during the episode loop
   ssize_t S = boards_all.size() / 13;
   py::array_t<int16_t> boards_np({S, (ssize_t)13});
-  py::array_t<int8_t> rounds_np({S});
+  py::array_t<int16_t> rounds_np(py::array::ShapeContainer{(ssize_t)S});
   py::array_t<int16_t> draws_np({S, (ssize_t)3});
   py::array_t<int16_t> deck_np({S});
   {

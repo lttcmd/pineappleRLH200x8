@@ -17,7 +17,7 @@ namespace py = pybind11;
 // 682..837: draw 3 * 52 one-hots (contiguous blocks)
 
 py::array_t<float> encode_state_batch_ints(py::array_t<int16_t> boards,  // (N,13)
-                                           py::array_t<int8_t> rounds,   // (N,)
+                                           py::array_t<int16_t> rounds,   // (N,)
                                            py::array_t<int16_t> draws,   // (N,3)
                                            py::array_t<int16_t> deck_sizes) { // (N,)
   auto B = boards.unchecked<2>();

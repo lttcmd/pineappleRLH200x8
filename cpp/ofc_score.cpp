@@ -125,16 +125,35 @@ static bool validate_board(const std::array<int,5>& bottom_r, const std::array<i
   std::string mid_t = evaluate_5(middle_r, middle_s);
   if (type_rank(bot_t) <= type_rank(mid_t)) return false;
   // middle > top: simple rule approximate (matches Python simplification)
-  // If top trips, middle must be full house or better or higher trips
-  int top_trips = top_trips_royalty(top_r);
-  if (top_trips>0){
+  //
+  // IMPORTANT: For ordering we must treat *all* pairs/trips on top as such,
+  // even when they do not earn royalties (e.g. 22–55). Royalties are a
+  // separate concern.
+  std::array<int,15> cnt{};
+  cnt.fill(0);
+  for (int r : top_r) {
+    if (r >= 2 && r <= 14) cnt[r]++;
+  }
+  bool top_is_trips = false;
+  bool top_is_pair = false;
+  for (int r = 2; r <= 14; ++r) {
+    if (cnt[r] == 3) {
+      top_is_trips = true;
+      break;
+    }
+    if (cnt[r] == 2) {
+      top_is_pair = true;
+    }
+  }
+
+  // If top trips, middle must be full house or better or higher trips.
+  if (top_is_trips){
     if (!(mid_t=="full_house" || mid_t=="quads" || mid_t=="straight_flush" || mid_t=="royal_flush" || mid_t=="trips")){
       return false;
     }
   } else {
-    // if top pair, middle must be at least trips
-    int top_pair = top_pair_royalty(top_r) > 0 ? 1 : 0;
-    if (top_pair){
+    // If top pair (any rank), middle must be at least trips.
+    if (top_is_pair){
       if (mid_t=="high_card" || mid_t=="pair" || mid_t=="two_pair") return false;
     } else {
       // top high card: require middle high card higher top high

@@ -28,12 +28,13 @@ py::tuple step_state_round0(py::array_t<int16_t> board,
                             py::array_t<int16_t> slots5);
 // Forward decl: encoding
 py::array_t<float> encode_state_batch_ints(py::array_t<int16_t> boards,  // (N,13) -1 or 0..51
-                                           py::array_t<int8_t> rounds,   // (N,)
+                                           py::array_t<int16_t> rounds,   // (N,)
                                            py::array_t<int16_t> draws,   // (N,3) -1 or 0..51
                                            py::array_t<int16_t> deck_sizes); // (N,)
 // Episode generator
 py::tuple generate_random_episodes(uint64_t seed, int num_episodes);
 py::tuple generate_sfl_dataset(uint64_t seed, int num_examples);
+py::dict simulate_sfl_stats(uint64_t seed, int num_episodes);
 // Engine APIs
 uint64_t create_engine(uint64_t seed);
 void destroy_engine(uint64_t handle);
@@ -72,9 +73,21 @@ PYBIND11_MODULE(ofc_cpp, m) {
   m.def("sfl_choose_action", &sfl_choose_action,
         py::arg("board"), py::arg("round_idx"), py::arg("current_draw"), py::arg("deck"),
         "Choose best action index via native SFL heuristic. Returns candidate index in legal action list.");
+  m.def("set_sfl_shaping", &set_sfl_shaping,
+        py::arg("foul_penalty") = -5.0f,
+        py::arg("pass_penalty") = -3.0f,
+        py::arg("medium_bonus") = 3.0f,
+        py::arg("strong_bonus") = 5.0f,
+        py::arg("monster_mult") = 1.0f,
+        "Configure SFL rollout reward shaping (planning-only). "
+        "Does not affect canonical game scoring. "
+        "foul_penalty < 0, pass_penalty < 0, medium/strong_bonus >= 0, monster_mult >= 0.");
   m.def("generate_sfl_dataset", &generate_sfl_dataset,
         py::arg("seed"), py::arg("num_examples"),
         "Generate a dataset of encoded states and SFL-chosen action indices.");
+  m.def("simulate_sfl_stats", &simulate_sfl_stats,
+        py::arg("seed"), py::arg("num_episodes"),
+        "Run the native SFL heuristic for many full hands and return aggregate foul/pass/royalty stats.");
 
   // Engine bindings
   m.def("create_engine", &create_engine, py::arg("seed"),

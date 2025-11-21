@@ -12,6 +12,7 @@
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include "Rules.hpp"
@@ -36,13 +37,21 @@ py::tuple step_state(py::array_t<int16_t> board,
                      int place0_keep_idx, int place0_slot,
                      int place1_keep_idx, int place1_slot);
 py::array_t<float> encode_state_batch_ints(py::array_t<int16_t> boards,
-                                           py::array_t<int8_t> rounds,
+                                           py::array_t<int16_t> rounds,
                                            py::array_t<int16_t> draws,
                                            py::array_t<int16_t> deck_sizes);
 
+// Canonical OFC single-board scorer (royalties / foul penalty) from ofc_score.cpp.
+std::pair<float, bool> score_board_from_ints(py::array_t<int16_t> bottom,
+                                             py::array_t<int16_t> middle,
+                                             py::array_t<int16_t> top);
+
 namespace {
 
-constexpr std::array<int, 5> kSamplesPerRound = {48, 36, 24, 16, 8};
+// Number of rollout samples used per round when evaluating an action.
+// Round 0 is the most important street: we double its samples to get a
+// less noisy estimate of long-term potential from the initial layout.
+constexpr std::array<int, 5> kSamplesPerRound = {96, 36, 24, 16, 8};
 constexpr std::array<int, 5> kSamplesPerRoundFast = {2, 2, 1, 1, 1};
 
 thread_local bool g_force_fast_samples = false;
@@ -54,6 +63,25 @@ struct FastSamplesGuard {
   }
   ~FastSamplesGuard() { g_force_fast_samples = prev; }
 };
+
+struct SflShapingConfig {
+  float foul_penalty;   // planning-time reward for a foul (negative)
+  float pass_penalty;   // planning-time reward for a zero-royalty pass (negative)
+  float medium_bonus;   // added to royalties for 4 <= r < 8
+  float strong_bonus;   // added to royalties for 8 <= r < 12
+  float monster_mult;   // multiplier applied to royalties when r >= 12
+};
+
+// Default shaping chosen from parameter sweep ("sf_base") as a stable,
+// royalty-seeking baseline that RL can improve on. We slightly upweight
+// monster hands (monster_mult=10) so obviously huge boards are preferred
+// in planning when they are available.
+static SflShapingConfig g_sfl_cfg{
+    /*foul_penalty=*/-4.0f,
+    /*pass_penalty=*/-3.0f,
+    /*medium_bonus=*/4.0f,
+    /*strong_bonus=*/8.0f,
+    /*monster_mult=*/10.0f};
 
 struct PartialBoard {
   std::vector<int16_t> bottom;
@@ -232,53 +260,80 @@ int top_trips_royalty(const std::array<int16_t, 3>& cards) {
   return 0;
 }
 
-float score_completed_board(const std::array<int16_t, 5>& bottom,
-                            const std::array<int16_t, 5>& middle,
-                            const std::array<int16_t, 3>& top) {
-  HandType bottom_type = classify_hand(bottom);
-  HandType middle_type = classify_hand(middle);
-  int bottom_rank = hand_rank_value(bottom_type);
-  int middle_rank = hand_rank_value(middle_type);
+// Canonical OFC scorer: returns (royalties or -FOUL_PENALTY, fouled?) using
+// the same logic as Python. This is the *true* game score.
+std::pair<float, bool> canonical_score_completed_board(
+    const std::array<int16_t, 5>& bottom,
+    const std::array<int16_t, 5>& middle,
+    const std::array<int16_t, 3>& top) {
+  py::array_t<int16_t> bottom_np(py::array::ShapeContainer{5});
+  py::array_t<int16_t> middle_np(py::array::ShapeContainer{5});
+  py::array_t<int16_t> top_np(py::array::ShapeContainer{3});
 
-  bool foul = bottom_rank <= middle_rank;
-  std::array<int, 3> top_ranks{};
-  for (int i = 0; i < 3; ++i) top_ranks[i] = rank_from_card(top[i]);
-  int top_pair = top_pair_royalty(top);
-  int top_trips = top_trips_royalty(top);
-
-  if (!foul) {
-    if (top_trips > 0) {
-      switch (middle_type) {
-        case HandType::kTrips:
-        case HandType::kFullHouse:
-        case HandType::kQuads:
-        case HandType::kStraightFlush:
-        case HandType::kRoyalFlush:
-          break;
-        default:
-          foul = true;
-          break;
-      }
-    } else if (top_pair > 0) {
-      if (middle_rank < hand_rank_value(HandType::kTrips)) foul = true;
-    } else {
-      if (middle_type == HandType::kHighCard) {
-        int mid_max = 0;
-        for (int i = 0; i < 5; ++i) mid_max = std::max(mid_max, rank_from_card(middle[i]));
-        int top_max = std::max({top_ranks[0], top_ranks[1], top_ranks[2]});
-        if (mid_max <= top_max) foul = true;
-      }
-    }
+  auto b_ptr = bottom_np.mutable_data();
+  auto m_ptr = middle_np.mutable_data();
+  auto t_ptr = top_np.mutable_data();
+  for (int i = 0; i < 5; ++i) {
+    b_ptr[i] = bottom[i];
+    m_ptr[i] = middle[i];
+  }
+  for (int i = 0; i < 3; ++i) {
+    t_ptr[i] = top[i];
   }
 
-  if (foul) {
-    return -static_cast<float>(ofc::rules::FOUL_PENALTY);
+  return score_board_from_ints(bottom_np, middle_np, top_np);
+}
+
+// SFL-internal shaped score: slightly softer foul penalty so the heuristic
+// will sometimes take high-royalty but risky lines.
+//
+// - Canonical scoring uses -FOUL_PENALTY (e.g. -6) for fouls.
+// - Here we treat fouls as a milder -3 while keeping royalties unchanged.
+//   This encourages "go for it" plays when the upside is large.
+float sfl_reward_completed_board(const std::array<int16_t, 5>& bottom,
+                                 const std::array<int16_t, 5>& middle,
+                                 const std::array<int16_t, 3>& top) {
+  auto res = canonical_score_completed_board(bottom, middle, top);
+  float score = res.first;   // canonical royalties (>=0) or -FOUL_PENALTY
+  bool fouled = res.second;
+
+  // Internal foul penalty: configurable but typically slightly softer than
+  // real -6. We still want fouls to hurt more than a safe pass, but not so
+  // much that SFL never takes real shots.
+  if (fouled) {
+    return g_sfl_cfg.foul_penalty;
   }
 
-  int royalties = five_card_royalty(bottom_type, false) +
-                  five_card_royalty(middle_type, true) +
-                  std::max(top_pair, top_trips);
-  return static_cast<float>(royalties);
+  // For non-fouling boards, shape rewards:
+  // - Actively punish completely safe, no-royalty passes (score == 0) so SFL
+  //   does not "play for zero".
+  // - Keep small royalties roughly neutral.
+  // - Strongly upweight big royalty totals so SFL is willing to gamble when the
+  //   upside is truly large. This does NOT change the real game score, only
+  //   the planning objective.
+  float r = std::max(0.0f, score);
+  if (r <= 0.0f) {
+    // Zero-royalty pass: configurable negative to discourage "just pass".
+    return g_sfl_cfg.pass_penalty;
+  }
+  // Very small royalties (e.g. bottom straight): almost neutral.
+  if (r > 0.0f && r < 4.0f) {
+    return r;
+  }
+  // Solid but not insane (typical full houses/small flushes, etc.).
+  if (r >= 4.0f && r < 8.0f) {
+    return r + g_sfl_cfg.medium_bonus;
+  }
+  // Strong boards (bigger flushes, multiple-row royalties).
+  if (r >= 8.0f && r < 12.0f) {
+    return r + g_sfl_cfg.strong_bonus;
+  }
+  // Monster hands (quads / straight flush / huge top trips / multi-row bombs).
+  if (r >= 12.0f) {
+    return r + g_sfl_cfg.monster_mult * r;
+  }
+  // Small royalties (straights / tiny flushes) unchanged.
+  return r;
 }
 
 std::vector<std::vector<int16_t>> combinations(const std::vector<int16_t>& cards,
@@ -368,7 +423,7 @@ float rollout_value(const std::array<int16_t, 13>& board,
     auto bottom_full = merge_row<5>(partial.bottom, {});
     auto middle_full = merge_row<5>(partial.middle, {});
     auto top_full = merge_row<3>(partial.top, {});
-    return score_completed_board(bottom_full, middle_full, top_full);
+    return sfl_reward_completed_board(bottom_full, middle_full, top_full);
   }
 
   if (static_cast<int>(deck.size()) < total_need) {
@@ -376,7 +431,15 @@ float rollout_value(const std::array<int16_t, 13>& board,
   }
 
   int clamped_round = std::clamp(next_round, 0, 4);
-  const auto& table = g_force_fast_samples ? kSamplesPerRoundFast : kSamplesPerRound;
+  // Allow forcing fast sampling globally via environment as well as via
+  // the thread-local guard used during dataset generation.
+  static const bool kFastFromEnv = []() {
+    const char* env = std::getenv("OFC_SFL_FAST");
+    return env && env[0] != '\0' && env[0] != '0';
+  }();
+  const auto& table = (g_force_fast_samples || kFastFromEnv)
+                          ? kSamplesPerRoundFast
+                          : kSamplesPerRound;
   int samples = std::max(1, table[clamped_round]);
   uint64_t seed = hash_state(board, next_round, deck);
 
@@ -400,7 +463,7 @@ float rollout_value(const std::array<int16_t, 13>& board,
         auto bottom_full = merge_row<5>(partial.bottom, bottom_add);
         auto middle_full = merge_row<5>(partial.middle, middle_add);
         auto top_full = merge_row<3>(partial.top, after_middle);
-        float score = score_completed_board(bottom_full, middle_full, top_full);
+        float score = sfl_reward_completed_board(bottom_full, middle_full, top_full);
         if (score > best) best = score;
       }
     }
@@ -413,6 +476,18 @@ float rollout_value(const std::array<int16_t, 13>& board,
 }
 
 }  // namespace
+
+void set_sfl_shaping(float foul_penalty,
+                     float pass_penalty,
+                     float medium_bonus,
+                     float strong_bonus,
+                     float monster_mult) {
+  g_sfl_cfg.foul_penalty = foul_penalty;
+  g_sfl_cfg.pass_penalty = pass_penalty;
+  g_sfl_cfg.medium_bonus = medium_bonus;
+  g_sfl_cfg.strong_bonus = strong_bonus;
+  g_sfl_cfg.monster_mult = monster_mult;
+}
 
 int sfl_choose_action(py::array_t<int16_t> board,
                       int round_idx,
@@ -427,10 +502,49 @@ int sfl_choose_action(py::array_t<int16_t> board,
     py::array_t<int16_t> placements = legal_actions_round0(board_np);
     auto placement_view = placements.unchecked<3>();
     int total = static_cast<int>(placements.shape(0));
+
+    // Hard rule: if the initial 5 cards themselves form a strong 5-card
+    // hand (straight, flush, full house, quads, straight-flush, royal),
+    // then prefer an action that puts all five on the bottom row if one
+    // exists. This bakes in a human-style heuristic for obvious monsters.
+    if (current_draw.shape(0) == 5 && total > 0) {
+      std::array<int16_t,5> initial{};
+      auto cd = current_draw.unchecked<1>();
+      for (int i = 0; i < 5; ++i) initial[i] = cd(i);
+      HandType t = classify_hand(initial);
+      bool premium =
+          (t == HandType::kStraight) ||
+          (t == HandType::kFlush) ||
+          (t == HandType::kFullHouse) ||
+          (t == HandType::kQuads) ||
+          (t == HandType::kStraightFlush) ||
+          (t == HandType::kRoyalFlush);
+      if (premium) {
+        for (int idx = 0; idx < total; ++idx) {
+          bool all_bottom = true;
+          for (int i = 0; i < 5; ++i) {
+            int slot_idx = placement_view(idx, i, 1);
+            if (slot_idx < 0 || slot_idx > 4) {
+              all_bottom = false;
+              break;
+            }
+          }
+          if (all_bottom) {
+            return idx;
+          }
+        }
+      }
+    }
     for (int idx = 0; idx < total; ++idx) {
-      py::array_t<int16_t> slots_np({5});
-      auto slots = slots_np.mutable_unchecked<1>();
-      for (int i = 0; i < 5; ++i) slots(i) = placement_view(idx, i, 1);
+      py::array_t<int16_t> slots_np(py::array::ShapeContainer{5});
+      auto buf = slots_np.request();
+      auto sl_ptr = static_cast<int16_t*>(buf.ptr);
+      for (int i = 0; i < 5; ++i) sl_ptr[i] = -1;
+      for (int i = 0; i < 5; ++i) {
+        int card_idx = placement_view(idx, i, 0);
+        int slot_idx = placement_view(idx, i, 1);
+        if (card_idx >=0 && card_idx < 5) sl_ptr[card_idx] = slot_idx;
+      }
       auto res = step_state_round0(board_np, current_draw, deck_np, slots_np);
       auto next_board = res[0].cast<py::array_t<int16_t>>();
       int next_round = res[1].cast<int>();
@@ -438,6 +552,8 @@ int sfl_choose_action(py::array_t<int16_t> board,
       auto board_arr = board_from_numpy(next_board);
       auto deck_vec = deck_from_numpy(next_deck);
       float score = rollout_value(board_arr, next_round, deck_vec);
+
+      // Track best overall score.
       if (score > best_score) {
         best_score = score;
         best_idx = idx;
@@ -467,6 +583,8 @@ int sfl_choose_action(py::array_t<int16_t> board,
     auto board_arr = board_from_numpy(next_board);
     auto deck_vec = deck_from_numpy(next_deck);
     float score = rollout_value(board_arr, next_round, deck_vec);
+
+    // Track best overall score.
     if (score > best_score) {
       best_score = score;
       best_idx = idx;
@@ -515,22 +633,23 @@ py::tuple generate_sfl_dataset(uint64_t seed, int num_examples) {
               " debug_mode=", debug_mode,
               " num_examples=", num_examples);
   }
-  const bool verbose = debug_mode || num_examples <= 16;
+  const bool verbose = debug_mode;
 
   std::mt19937_64 rng(seed);
   SimpleState st;
   reset_state(st, rng);
 
   std::vector<int16_t> boards_all;
-  std::vector<int8_t> rounds_all;
+  std::vector<int16_t> rounds_all;
   std::vector<int16_t> draws_all;
   std::vector<int16_t> deck_sizes_all;
   std::vector<int32_t> labels_all;
 
   std::vector<int16_t> action_boards;
-  std::vector<int8_t> action_rounds;
+  std::vector<int16_t> action_rounds;
   std::vector<int16_t> action_draws;
   std::vector<int16_t> action_deck_sizes;
+  int debug_action_counter = 0;
   std::vector<int32_t> action_counts_per_state;
 
   boards_all.reserve(num_examples * 13);
@@ -547,7 +666,7 @@ py::tuple generate_sfl_dataset(uint64_t seed, int num_examples) {
                                  py::array_t<int16_t>& deck_arr) {
     auto b = board_arr.unchecked<1>();
     for (int i=0;i<13;++i) action_boards.push_back(b(i));
-    action_rounds.push_back(static_cast<int8_t>(next_round));
+    action_rounds.push_back(static_cast<int16_t>(next_round));
     auto d = draw_arr.unchecked<1>();
     for (int i=0;i<3;++i) {
       int16_t val = (i < d.shape(0)) ? d(i) : static_cast<int16_t>(-1);
@@ -555,59 +674,80 @@ py::tuple generate_sfl_dataset(uint64_t seed, int num_examples) {
     }
     auto deck_view = deck_arr.unchecked<1>();
     action_deck_sizes.push_back(static_cast<int16_t>(deck_view.shape(0)));
+    if (debug_mode && debug_action_counter < 4) {
+      py::gil_scoped_acquire gil;
+      py::list board_list;
+      for (int i=0;i<13;++i) board_list.append(b(i));
+      py::print("[ofc_cpp] action_state_debug board", board_list, "round", next_round);
+      debug_action_counter++;
+    }
   };
 
   for (int n=0;n<num_examples;++n) {
     auto state_start = std::chrono::steady_clock::now();
+    if (st.done) {
+      reset_state(st, rng);
+    }
+    if (verbose) {
+      py::gil_scoped_acquire gil;
+      py::print("[ofc_cpp] record_state", n+1, "round_idx", st.round_idx);
+      if (n==0) {
+        py::list init_cards;
+        for (int i=0;i<5;++i) init_cards.append(st.initial5[i]);
+        py::print("[ofc_cpp] initial5", init_cards);
+      }
+    }
     for (int i=0;i<13;++i) boards_all.push_back(st.board[i]);
-    rounds_all.push_back(static_cast<int8_t>(st.round_idx));
+    rounds_all.push_back(static_cast<int16_t>(st.round_idx));
+    if (verbose) {
+      py::gil_scoped_acquire gil;
+      py::print("  stored_round", rounds_all.back());
+    }
     for (int i=0;i<3;++i) draws_all.push_back(st.draw3[i]);
     deck_sizes_all.push_back(static_cast<int16_t>(st.deck.size()));
 
-    auto board_np = py::array_t<int16_t>({13});
-    auto b_m = board_np.mutable_unchecked<1>();
-    for (int i=0;i<13;++i) b_m(i) = st.board[i];
-    auto deck_np = py::array_t<int16_t>({(ssize_t)st.deck.size()});
-    auto d_m = deck_np.mutable_unchecked<1>();
-    for (ssize_t i=0;i<(ssize_t)st.deck.size();++i) d_m(i) = st.deck[i];
-    py::array_t<int16_t> draw_np = (st.round_idx == 0)
-        ? py::array_t<int16_t>({5})
-        : py::array_t<int16_t>({3});
-    if (st.round_idx == 0) {
-      auto draw_m = draw_np.mutable_unchecked<1>();
-      for (int i=0;i<5;++i) draw_m(i) = st.initial5[i];
-    } else {
-      auto draw_m = draw_np.mutable_unchecked<1>();
-      for (int i=0;i<3;++i) draw_m(i) = st.draw3[i];
-    }
-
-    int action_idx = sfl_choose_action(board_np, st.round_idx, draw_np, deck_np);
-    labels_all.push_back(action_idx);
-
+    auto board_np = py::array_t<int16_t>(py::array::ShapeContainer{13});
+    auto b_ptr = board_np.mutable_data();
+    for (int i=0;i<13;++i) b_ptr[i] = st.board[i];
+    auto deck_np = py::array_t<int16_t>(py::array::ShapeContainer{(ssize_t)st.deck.size()});
+    auto d_ptr = deck_np.mutable_data();
+    for (ssize_t i=0;i<(ssize_t)st.deck.size();++i) d_ptr[i] = st.deck[i];
     int action_count = 0;
+    int action_idx = -1;
+
     if (st.round_idx == 0) {
       py::array_t<int16_t> placements = legal_actions_round0(board_np);
-      auto P = placements.unchecked<3>();
       action_count = static_cast<int>(placements.shape(0));
 
+      if (action_count <= 0) {
+        labels_all.push_back(0);
+        action_counts_per_state.push_back(0);
+        st.done = true;
+        continue;
+      }
+
+      auto P = placements.unchecked<3>();
+      py::array_t<int16_t> draw5(py::array::ShapeContainer{5});
+      auto d5_ptr = draw5.mutable_data();
+      for (int i=0;i<5;++i) d5_ptr[i] = st.initial5[i];
+
       for (int k=0;k<action_count;++k) {
-        py::array_t<int16_t> board_copy({13});
-        auto bc = board_copy.mutable_unchecked<1>();
-        for (int i=0;i<13;++i) bc(i) = st.board[i];
-
-        py::array_t<int16_t> deck_copy({(ssize_t)st.deck.size()});
-        auto dc = deck_copy.mutable_unchecked<1>();
-        for (ssize_t i=0;i<(ssize_t)st.deck.size();++i) dc(i) = st.deck[i];
-
-        py::array_t<int16_t> draw_copy({5});
-        auto drawc = draw_copy.mutable_unchecked<1>();
-        for (int i=0;i<5;++i) drawc(i) = st.initial5[i];
-
-        py::array_t<int16_t> slots_np({5});
-        auto sl = slots_np.mutable_unchecked<1>();
-        for (int i=0;i<5;++i) sl(i) = P(k,i,1);
-
-        auto res = step_state_round0(board_copy, draw_copy, deck_copy, slots_np);
+        py::array_t<int16_t> slots_np(py::array::ShapeContainer{5});
+        auto buf = slots_np.request();
+        auto sl_ptr = static_cast<int16_t*>(buf.ptr);
+        for (int i=0;i<5;++i) sl_ptr[i] = -1;
+        for (int i=0;i<5;++i) {
+          int card_idx = P(k,i,0);
+          int slot_idx = P(k,i,1);
+          if (card_idx >=0 && card_idx < 5) sl_ptr[card_idx] = slot_idx;
+        }
+        if (verbose && k==0) {
+          py::gil_scoped_acquire gil;
+          py::list slot_list;
+          for (int i=0;i<5;++i) slot_list.append(sl_ptr[i]);
+          py::print("[ofc_cpp] action", k, "slots_np", slot_list);
+        }
+        auto res = step_state_round0(board_np, draw5, deck_np, slots_np);
         auto next_board = res[0].cast<py::array_t<int16_t>>();
         auto next_round = res[1].cast<int>();
         auto next_draw = res[2].cast<py::array_t<int16_t>>();
@@ -615,13 +755,19 @@ py::tuple generate_sfl_dataset(uint64_t seed, int num_examples) {
         record_action_state(next_board, next_round, next_draw, next_deck);
       }
 
-      auto sl_np = py::array_t<int16_t>({5});
-      auto sl_m = sl_np.mutable_unchecked<1>();
-      for (int i=0;i<5;++i) sl_m(i) = P(action_idx, i, 1);
-      auto c5_np = py::array_t<int16_t>({5});
-      auto c5_m = c5_np.mutable_unchecked<1>();
-      for (int i=0;i<5;++i) c5_m(i) = st.initial5[i];
-      auto res = step_state_round0(board_np, c5_np, deck_np, sl_np);
+      action_idx = sfl_choose_action(board_np, st.round_idx, draw5, deck_np);
+      if (action_idx < 0 || action_idx >= action_count) action_idx = 0;
+
+      py::array_t<int16_t> slots_np(py::array::ShapeContainer{5});
+      auto buf = slots_np.request();
+      auto sl_ptr = static_cast<int16_t*>(buf.ptr);
+      for (int i=0;i<5;++i) sl_ptr[i] = -1;
+      for (int i=0;i<5;++i) {
+        int card_idx = P(action_idx,i,0);
+        int slot_idx = P(action_idx,i,1);
+        if (card_idx >=0 && card_idx < 5) sl_ptr[card_idx] = slot_idx;
+      }
+      auto res = step_state_round0(board_np, draw5, deck_np, slots_np);
       auto b2 = res[0].cast<py::array_t<int16_t>>();
       auto b2r = b2.unchecked<1>();
       for (int i=0;i<13;++i) st.board[i] = b2r(i);
@@ -638,31 +784,29 @@ py::tuple generate_sfl_dataset(uint64_t seed, int num_examples) {
       py::tuple acts = legal_actions_rounds1to4(board_np, st.round_idx);
       auto keeps = acts[0].cast<py::array_t<int8_t>>();
       auto places = acts[1].cast<py::array_t<int16_t>>();
-      auto K = keeps.unchecked<2>();
-      auto P = places.unchecked<3>();
       action_count = static_cast<int>(keeps.shape(0));
 
+      if (action_count <= 0) {
+        labels_all.push_back(0);
+        action_counts_per_state.push_back(0);
+        st.done = true;
+        continue;
+      }
+
+      auto K = keeps.unchecked<2>();
+      auto P = places.unchecked<3>();
+      py::array_t<int16_t> draw3_np(py::array::ShapeContainer{3});
+      auto d3_ptr = draw3_np.mutable_data();
+      for (int i=0;i<3;++i) d3_ptr[i] = st.draw3[i];
+
       for (int k=0;k<action_count;++k) {
-        py::array_t<int16_t> board_copy({13});
-        auto bc = board_copy.mutable_unchecked<1>();
-        for (int i=0;i<13;++i) bc(i) = st.board[i];
-
-        py::array_t<int16_t> deck_copy({(ssize_t)st.deck.size()});
-        auto dc = deck_copy.mutable_unchecked<1>();
-        for (ssize_t i=0;i<(ssize_t)st.deck.size();++i) dc(i) = st.deck[i];
-
-        py::array_t<int16_t> draw_copy({3});
-        auto drawc = draw_copy.mutable_unchecked<1>();
-        for (int i=0;i<3;++i) drawc(i) = st.draw3[i];
-
         int keep_i = K(k,0);
         int keep_j = K(k,1);
         int p00 = P(k,0,0);
         int p01 = P(k,0,1);
         int p10 = P(k,1,0);
         int p11 = P(k,1,1);
-
-        auto res = step_state(board_copy, st.round_idx, draw_copy, deck_copy, keep_i, keep_j, p00, p01, p10, p11);
+        auto res = step_state(board_np, st.round_idx, draw3_np, deck_np, keep_i, keep_j, p00, p01, p10, p11);
         auto next_board = res[0].cast<py::array_t<int16_t>>();
         auto next_round = res[1].cast<int>();
         auto next_draw = res[2].cast<py::array_t<int16_t>>();
@@ -670,13 +814,16 @@ py::tuple generate_sfl_dataset(uint64_t seed, int num_examples) {
         record_action_state(next_board, next_round, next_draw, next_deck);
       }
 
+      action_idx = sfl_choose_action(board_np, st.round_idx, draw3_np, deck_np);
+      if (action_idx < 0 || action_idx >= action_count) action_idx = 0;
+
       int keep_i = K(action_idx,0);
       int keep_j = K(action_idx,1);
       int p00 = P(action_idx,0,0);
       int p01 = P(action_idx,0,1);
       int p10 = P(action_idx,1,0);
       int p11 = P(action_idx,1,1);
-      auto res = step_state(board_np, st.round_idx, draw_np, deck_np, keep_i, keep_j, p00, p01, p10, p11);
+      auto res = step_state(board_np, st.round_idx, draw3_np, deck_np, keep_i, keep_j, p00, p01, p10, p11);
       auto b2 = res[0].cast<py::array_t<int16_t>>();
       auto b2r = b2.unchecked<1>();
       for (int i=0;i<13;++i) st.board[i] = b2r(i);
@@ -691,6 +838,7 @@ py::tuple generate_sfl_dataset(uint64_t seed, int num_examples) {
       st.done = res[4].cast<bool>();
     }
 
+    labels_all.push_back(action_idx);
     action_counts_per_state.push_back(action_count);
 
     if (verbose) {
@@ -700,7 +848,9 @@ py::tuple generate_sfl_dataset(uint64_t seed, int num_examples) {
       py::print("[ofc_cpp] state", n+1, "/", num_examples,
                 "round", st.round_idx,
                 "actions", action_count,
-                "time_ms", ms);
+                "time_ms", ms,
+                "done", st.done,
+                "chosen_idx", action_idx);
     }
 
     if (st.done) {
@@ -710,8 +860,14 @@ py::tuple generate_sfl_dataset(uint64_t seed, int num_examples) {
 
   py::array_t<int16_t> boards_arr({num_examples,13});
   std::memcpy(boards_arr.mutable_data(), boards_all.data(), boards_all.size()*sizeof(int16_t));
-  py::array_t<int8_t> rounds_arr({num_examples});
-  std::memcpy(rounds_arr.mutable_data(), rounds_all.data(), rounds_all.size()*sizeof(int8_t));
+  py::array_t<int16_t> rounds_arr(py::array::ShapeContainer{(ssize_t)num_examples});
+  {
+    auto Rdst = rounds_arr.mutable_data();
+    for (int i=0;i<num_examples;++i) {
+      int v = static_cast<int>(rounds_all[i]);
+      Rdst[i] = static_cast<int16_t>(v);
+    }
+  }
   py::array_t<int16_t> draws_arr({num_examples,3});
   std::memcpy(draws_arr.mutable_data(), draws_all.data(), draws_all.size()*sizeof(int16_t));
   py::array_t<int16_t> deck_sizes_arr({num_examples});
@@ -728,8 +884,8 @@ py::tuple generate_sfl_dataset(uint64_t seed, int num_examples) {
   int total_actions = action_offsets.back();
   py::array_t<int16_t> action_boards_arr({total_actions,13});
   std::memcpy(action_boards_arr.mutable_data(), action_boards.data(), action_boards.size()*sizeof(int16_t));
-  py::array_t<int8_t> action_rounds_arr({total_actions});
-  std::memcpy(action_rounds_arr.mutable_data(), action_rounds.data(), action_rounds.size()*sizeof(int8_t));
+  py::array_t<int16_t> action_rounds_arr(py::array::ShapeContainer{(ssize_t)total_actions});
+  std::memcpy(action_rounds_arr.mutable_data(), action_rounds.data(), action_rounds.size()*sizeof(int16_t));
   py::array_t<int16_t> action_draws_arr({total_actions,3});
   std::memcpy(action_draws_arr.mutable_data(), action_draws.data(), action_draws.size()*sizeof(int16_t));
   py::array_t<int16_t> action_deck_sizes_arr({total_actions});
@@ -744,6 +900,189 @@ py::tuple generate_sfl_dataset(uint64_t seed, int num_examples) {
   for (auto v : action_offsets) offsets_py.append(v);
 
   return py::make_tuple(encoded, labels_arr, offsets_py, action_encoded);
+}
+
+py::dict simulate_sfl_stats(uint64_t seed, int num_episodes) {
+  const bool fast_mode = []() {
+    const char* env = std::getenv("OFC_SFL_FAST");
+    return env && env[0] != '\0' && env[0] != '0';
+  }();
+  FastSamplesGuard fast_guard(fast_mode);
+
+  std::mt19937_64 rng(seed);
+  SimpleState st;
+  reset_state(st, rng);
+
+  struct Stats {
+    int episodes = 0;
+    int fouls = 0;
+    int passes = 0;
+    int royalty_boards = 0;
+    double reward_sum = 0.0;
+    double royalty_sum = 0.0;
+  } stats;
+
+  auto copy_board_array = [](const SimpleState& st, py::array_t<int16_t>& board_np) {
+    auto ptr = board_np.mutable_data();
+    for (int i = 0; i < 13; ++i) ptr[i] = st.board[i];
+  };
+
+  auto copy_deck_array = [](const SimpleState& st, py::array_t<int16_t>& deck_np) {
+    auto ptr = deck_np.mutable_data();
+    for (ssize_t i = 0; i < (ssize_t)st.deck.size(); ++i) ptr[i] = st.deck[i];
+  };
+
+  auto copy_draw3 = [](const SimpleState& st, py::array_t<int16_t>& draw_np) {
+    auto ptr = draw_np.mutable_data();
+    for (int i = 0; i < 3; ++i) ptr[i] = st.draw3[i];
+  };
+
+  while (stats.episodes < num_episodes) {
+    while (!st.done) {
+      py::array_t<int16_t> board_np(py::array::ShapeContainer{13});
+      copy_board_array(st, board_np);
+      py::array_t<int16_t> deck_np(py::array::ShapeContainer{(ssize_t)st.deck.size()});
+      copy_deck_array(st, deck_np);
+
+      if (st.round_idx == 0) {
+        py::array_t<int16_t> draw5(py::array::ShapeContainer{5});
+        auto d5_ptr = draw5.mutable_data();
+        for (int i = 0; i < 5; ++i) d5_ptr[i] = st.initial5[i];
+
+        py::array_t<int16_t> placements = legal_actions_round0(board_np);
+        int action_count = static_cast<int>(placements.shape(0));
+        if (action_count <= 0) {
+          st.done = true;
+          break;
+        }
+        int action_idx = sfl_choose_action(board_np, st.round_idx, draw5, deck_np);
+        if (action_idx < 0 || action_idx >= action_count) action_idx = 0;
+
+        auto P = placements.unchecked<3>();
+        py::array_t<int16_t> slots_np(py::array::ShapeContainer{5});
+        auto slots_ptr = slots_np.mutable_data();
+        for (int i = 0; i < 5; ++i) slots_ptr[i] = -1;
+        for (int i = 0; i < 5; ++i) {
+          int card_idx = P(action_idx, i, 0);
+          int slot_idx = P(action_idx, i, 1);
+          if (card_idx >= 0 && card_idx < 5) slots_ptr[card_idx] = slot_idx;
+        }
+        auto res = step_state_round0(board_np, draw5, deck_np, slots_np);
+        auto b2 = res[0].cast<py::array_t<int16_t>>();
+        auto b2r = b2.unchecked<1>();
+        for (int i = 0; i < 13; ++i) st.board[i] = b2r(i);
+        st.round_idx = res[1].cast<int>();
+        auto draw_next = res[2].cast<py::array_t<int16_t>>();
+        auto dr = draw_next.unchecked<1>();
+        for (int i = 0; i < 3; ++i) st.draw3[i] = dr(i);
+        auto deck_next = res[3].cast<py::array_t<int16_t>>();
+        auto dn = deck_next.unchecked<1>();
+        st.deck.resize(dn.shape(0));
+        for (ssize_t i = 0; i < dn.shape(0); ++i) st.deck[i] = dn(i);
+        st.done = res[4].cast<bool>();
+      } else {
+        py::tuple acts = legal_actions_rounds1to4(board_np, st.round_idx);
+        auto keeps = acts[0].cast<py::array_t<int8_t>>();
+        auto places = acts[1].cast<py::array_t<int16_t>>();
+        int action_count = static_cast<int>(keeps.shape(0));
+        if (action_count <= 0) {
+          st.done = true;
+          break;
+        }
+        py::array_t<int16_t> draw3_np(py::array::ShapeContainer{3});
+        copy_draw3(st, draw3_np);
+
+        int action_idx = sfl_choose_action(board_np, st.round_idx, draw3_np, deck_np);
+        if (action_idx < 0 || action_idx >= action_count) action_idx = 0;
+
+        auto K = keeps.unchecked<2>();
+        auto P = places.unchecked<3>();
+        int keep_i = K(action_idx, 0);
+        int keep_j = K(action_idx, 1);
+        int p00 = P(action_idx, 0, 0);
+        int p01 = P(action_idx, 0, 1);
+        int p10 = P(action_idx, 1, 0);
+        int p11 = P(action_idx, 1, 1);
+        auto res = step_state(board_np, st.round_idx, draw3_np, deck_np,
+                              keep_i, keep_j, p00, p01, p10, p11);
+        auto b2 = res[0].cast<py::array_t<int16_t>>();
+        auto b2r = b2.unchecked<1>();
+        for (int i = 0; i < 13; ++i) st.board[i] = b2r(i);
+        st.round_idx = res[1].cast<int>();
+        auto draw_next = res[2].cast<py::array_t<int16_t>>();
+        auto dr = draw_next.unchecked<1>();
+        for (int i = 0; i < 3; ++i) st.draw3[i] = dr(i);
+        auto deck_next = res[3].cast<py::array_t<int16_t>>();
+        auto dn = deck_next.unchecked<1>();
+        st.deck.resize(dn.shape(0));
+        for (ssize_t i = 0; i < dn.shape(0); ++i) st.deck[i] = dn(i);
+        st.done = res[4].cast<bool>();
+      }
+    }
+
+    std::array<int16_t,5> bottom{};
+    std::array<int16_t,5> middle{};
+    std::array<int16_t,3> top{};
+    bool incomplete = false;
+    for (int i = 0; i < 5; ++i) {
+      bottom[i] = st.board[i];
+      middle[i] = st.board[5 + i];
+      if (bottom[i] < 0 || middle[i] < 0) incomplete = true;
+    }
+    for (int i = 0; i < 3; ++i) {
+      top[i] = st.board[10 + i];
+      if (top[i] < 0) incomplete = true;
+    }
+
+    float reward = -static_cast<float>(ofc::rules::FOUL_PENALTY);
+    bool foul = true;
+    int royalties = 0;
+    if (!incomplete) {
+      auto res = canonical_score_completed_board(bottom, middle, top);
+      reward = res.first;
+      foul = res.second;
+      if (!foul) {
+        HandType bottom_type = classify_hand(bottom);
+        HandType middle_type = classify_hand(middle);
+        royalties = five_card_royalty(bottom_type, false) +
+                    five_card_royalty(middle_type, true) +
+                    std::max(top_pair_royalty(top), top_trips_royalty(top));
+      }
+    }
+
+    if (foul || incomplete) {
+      stats.fouls++;
+    } else if (royalties == 0) {
+      stats.passes++;
+    } else {
+      stats.royalty_boards++;
+      stats.royalty_sum += royalties;
+    }
+    stats.reward_sum += reward;
+    stats.episodes++;
+
+    reset_state(st, rng);
+  }
+
+  double total = static_cast<double>(stats.episodes);
+  double foul_rate = total > 0 ? static_cast<double>(stats.fouls) / total : 0.0;
+  double pass_rate = total > 0 ? static_cast<double>(stats.passes) / total : 0.0;
+  double royalty_rate = total > 0 ? static_cast<double>(stats.royalty_boards) / total : 0.0;
+  double avg_reward = total > 0 ? stats.reward_sum / total : 0.0;
+  double avg_royalty = stats.royalty_boards > 0 ? stats.royalty_sum / static_cast<double>(stats.royalty_boards) : 0.0;
+
+  py::dict out;
+  out["episodes"] = stats.episodes;
+  out["fast_mode"] = fast_mode;
+  out["fouls"] = stats.fouls;
+  out["passes"] = stats.passes;
+  out["royalty_boards"] = stats.royalty_boards;
+  out["foul_rate"] = foul_rate;
+  out["pass_rate"] = pass_rate;
+  out["royalty_rate"] = royalty_rate;
+  out["avg_reward"] = avg_reward;
+  out["avg_royalty"] = avg_royalty;
+  return out;
 }
 
 

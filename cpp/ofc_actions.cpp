@@ -2,6 +2,7 @@
 #include <pybind11/numpy.h>
 #include <vector>
 #include <cstdint>
+#include <array>
 
 namespace py = pybind11;
 
@@ -108,28 +109,65 @@ py::array_t<int16_t> legal_actions_round0(py::array_t<int16_t> board) {
   // Collect empty slots
   std::vector<int16_t> empty;
   empty.reserve(13);
-  for (int i=0;i<13;++i) if (b(i) == -1) empty.push_back(static_cast<int16_t>(i));
+  static const int preferred_order[13] = {0,5,10,1,6,11,2,7,12,3,8,4,9};
+  for (int idx : preferred_order) {
+    if (b(idx) == -1) {
+      empty.push_back(static_cast<int16_t>(idx));
+    }
+  }
   if (empty.size() < 5) {
     return py::array_t<int16_t>(py::array::ShapeContainer{0,5,2});
   }
-  if (empty.size() > MAX_EMPTY_SLOTS_CONSIDERED) {
-    empty.resize(MAX_EMPTY_SLOTS_CONSIDERED);
+  // Build up to MAX_INITIAL_PERMUTATIONS distinct slot selections.
+  // We always try to include the "all on bottom" pattern first if the
+  // 5 bottom slots are empty, so SFL can choose to lock a monster
+  // (straight/flush/full-house/quads) on the bottom row when available.
+  std::vector<std::array<int16_t,5>> slot_sets;
+  slot_sets.reserve(MAX_INITIAL_PERMUTATIONS);
+
+  // Special-case: all 5 bottom slots available
+  {
+    std::array<int16_t,5> bottom_slots{};
+    int bc = 0;
+    for (int s = 0; s < 5; ++s) {
+      if (b(s) == -1) {
+        bottom_slots[bc++] = static_cast<int16_t>(s);
+      }
+    }
+    if (bc == 5) {
+      slot_sets.push_back(bottom_slots);
+    }
   }
-  // Generate first MAX_INITIAL_PERMUTATIONS permutations of [0..4]
-  int total = MAX_INITIAL_PERMUTATIONS;
+
+  const size_t n = empty.size();
+  for (size_t i0=0; i0<n && slot_sets.size()<MAX_INITIAL_PERMUTATIONS; ++i0) {
+    for (size_t i1=i0+1; i1<n && slot_sets.size()<MAX_INITIAL_PERMUTATIONS; ++i1) {
+      for (size_t i2=i1+1; i2<n && slot_sets.size()<MAX_INITIAL_PERMUTATIONS; ++i2) {
+        for (size_t i3=i2+1; i3<n && slot_sets.size()<MAX_INITIAL_PERMUTATIONS; ++i3) {
+          for (size_t i4=i3+1; i4<n && slot_sets.size()<MAX_INITIAL_PERMUTATIONS; ++i4) {
+            slot_sets.push_back({empty[i0], empty[i1], empty[i2], empty[i3], empty[i4]});
+          }
+        }
+      }
+    }
+  }
+  if (slot_sets.empty()) {
+    return py::array_t<int16_t>(py::array::ShapeContainer{0,5,2});
+  }
+  const int total = static_cast<int>(slot_sets.size());
   auto placements = py::array_t<int16_t>(py::array::ShapeContainer{total, 5, 2});
   auto P = placements.mutable_unchecked<3>();
-  // We map perm[i] -> empty[i]
-  // Use a simple fixed set of 12 permutations
   static const int perms[12][5] = {
     {0,1,2,3,4},{0,1,2,4,3},{0,1,3,2,4},{0,1,3,4,2},
     {0,2,1,3,4},{0,2,1,4,3},{0,2,3,1,4},{0,2,3,4,1},
     {1,0,2,3,4},{1,0,2,4,3},{1,0,3,2,4},{1,0,3,4,2}
   };
   for (int k=0;k<total;++k) {
+    const auto& slots = slot_sets[k];
+    const int* perm = perms[k % 12];
     for (int i=0;i<5;++i) {
-      P(k,i,0) = static_cast<int16_t>(perms[k][i]);     // card_idx 0..4
-      P(k,i,1) = empty[i];                              // slot_idx chosen i
+      P(k,i,0) = static_cast<int16_t>(perm[i]);
+      P(k,i,1) = slots[i];
     }
   }
   return placements;
