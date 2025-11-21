@@ -593,6 +593,123 @@ int sfl_choose_action(py::array_t<int16_t> board,
   return best_idx;
 }
 
+// Choose action from pre-computed legal actions (for dataset generation)
+// This ensures the action index matches the recorded action set
+int sfl_choose_action_from_round0(
+    py::array_t<int16_t> board,
+    py::array_t<int16_t> placements,  // Pre-computed legal actions
+    py::array_t<int16_t> current_draw,
+    py::array_t<int16_t> deck) {
+  auto board_np = board;
+  auto deck_np = deck;
+  float best_score = -std::numeric_limits<float>::infinity();
+  int best_idx = -1;
+
+  auto placement_view = placements.unchecked<3>();
+  int total = static_cast<int>(placements.shape(0));
+  if (total <= 0) return -1;
+
+  // Hard rule: if the initial 5 cards themselves form a strong 5-card
+  // hand (straight, flush, full house, quads, straight-flush, royal),
+  // then prefer an action that puts all five on the bottom row if one
+  // exists. This bakes in a human-style heuristic for obvious monsters.
+  if (current_draw.shape(0) == 5 && total > 0) {
+    std::array<int16_t,5> initial{};
+    auto cd = current_draw.unchecked<1>();
+    for (int i = 0; i < 5; ++i) initial[i] = cd(i);
+    HandType t = classify_hand(initial);
+    bool premium =
+        (t == HandType::kStraight) ||
+        (t == HandType::kFlush) ||
+        (t == HandType::kFullHouse) ||
+        (t == HandType::kQuads) ||
+        (t == HandType::kStraightFlush) ||
+        (t == HandType::kRoyalFlush);
+    if (premium) {
+      for (int idx = 0; idx < total; ++idx) {
+        bool all_bottom = true;
+        for (int i = 0; i < 5; ++i) {
+          int slot_idx = placement_view(idx, i, 1);
+          if (slot_idx < 0 || slot_idx > 4) {
+            all_bottom = false;
+            break;
+          }
+        }
+        if (all_bottom) {
+          return idx;
+        }
+      }
+    }
+  }
+  for (int idx = 0; idx < total; ++idx) {
+    py::array_t<int16_t> slots_np(py::array::ShapeContainer{5});
+    auto buf = slots_np.request();
+    auto sl_ptr = static_cast<int16_t*>(buf.ptr);
+    for (int i = 0; i < 5; ++i) sl_ptr[i] = -1;
+    for (int i = 0; i < 5; ++i) {
+      int card_idx = placement_view(idx, i, 0);
+      int slot_idx = placement_view(idx, i, 1);
+      if (card_idx >=0 && card_idx < 5) sl_ptr[card_idx] = slot_idx;
+    }
+    auto res = step_state_round0(board_np, current_draw, deck_np, slots_np);
+    auto next_board = res[0].cast<py::array_t<int16_t>>();
+    int next_round = res[1].cast<int>();
+    auto next_deck = res[3].cast<py::array_t<int16_t>>();
+    auto board_arr = board_from_numpy(next_board);
+    auto deck_vec = deck_from_numpy(next_deck);
+    float score = rollout_value(board_arr, next_round, deck_vec);
+
+    // Track best overall score.
+    if (score > best_score) {
+      best_score = score;
+      best_idx = idx;
+    }
+  }
+  return best_idx;
+}
+
+int sfl_choose_action_from_rounds1to4(
+    py::array_t<int16_t> board,
+    int round_idx,
+    py::array_t<int8_t> keeps,      // Pre-computed legal actions
+    py::array_t<int16_t> places,    // Pre-computed legal actions
+    py::array_t<int16_t> current_draw,
+    py::array_t<int16_t> deck) {
+  auto board_np = board;
+  auto deck_np = deck;
+  float best_score = -std::numeric_limits<float>::infinity();
+  int best_idx = -1;
+
+  auto keep_view = keeps.unchecked<2>();
+  auto place_view = places.unchecked<3>();
+  int total = static_cast<int>(keeps.shape(0));
+  if (total <= 0) return -1;
+
+  for (int idx = 0; idx < total; ++idx) {
+    int keep_i = keep_view(idx, 0);
+    int keep_j = keep_view(idx, 1);
+    int p00 = place_view(idx, 0, 0);
+    int p01 = place_view(idx, 0, 1);
+    int p10 = place_view(idx, 1, 0);
+    int p11 = place_view(idx, 1, 1);
+    auto res = step_state(board_np, round_idx, current_draw, deck_np,
+                          keep_i, keep_j, p00, p01, p10, p11);
+    auto next_board = res[0].cast<py::array_t<int16_t>>();
+    int next_round = res[1].cast<int>();
+    auto next_deck = res[3].cast<py::array_t<int16_t>>();
+    auto board_arr = board_from_numpy(next_board);
+    auto deck_vec = deck_from_numpy(next_deck);
+    float score = rollout_value(board_arr, next_round, deck_vec);
+
+    // Track best overall score.
+    if (score > best_score) {
+      best_score = score;
+      best_idx = idx;
+    }
+  }
+  return best_idx;
+}
+
 struct SimpleState {
   std::array<int16_t,13> board;
   std::vector<int16_t> deck;
@@ -755,7 +872,7 @@ py::tuple generate_sfl_dataset(uint64_t seed, int num_examples) {
         record_action_state(next_board, next_round, next_draw, next_deck);
       }
 
-      action_idx = sfl_choose_action(board_np, st.round_idx, draw5, deck_np);
+      action_idx = sfl_choose_action_from_round0(board_np, placements, draw5, deck_np);
       if (action_idx < 0 || action_idx >= action_count) action_idx = 0;
 
       py::array_t<int16_t> slots_np(py::array::ShapeContainer{5});
@@ -814,7 +931,7 @@ py::tuple generate_sfl_dataset(uint64_t seed, int num_examples) {
         record_action_state(next_board, next_round, next_draw, next_deck);
       }
 
-      action_idx = sfl_choose_action(board_np, st.round_idx, draw3_np, deck_np);
+      action_idx = sfl_choose_action_from_rounds1to4(board_np, st.round_idx, keeps, places, draw3_np, deck_np);
       if (action_idx < 0 || action_idx >= action_count) action_idx = 0;
 
       int keep_i = K(action_idx,0);
@@ -955,7 +1072,7 @@ py::dict simulate_sfl_stats(uint64_t seed, int num_episodes) {
           st.done = true;
           break;
         }
-        int action_idx = sfl_choose_action(board_np, st.round_idx, draw5, deck_np);
+        int action_idx = sfl_choose_action_from_round0(board_np, placements, draw5, deck_np);
         if (action_idx < 0 || action_idx >= action_count) action_idx = 0;
 
         auto P = placements.unchecked<3>();
@@ -992,7 +1109,7 @@ py::dict simulate_sfl_stats(uint64_t seed, int num_episodes) {
         py::array_t<int16_t> draw3_np(py::array::ShapeContainer{3});
         copy_draw3(st, draw3_np);
 
-        int action_idx = sfl_choose_action(board_np, st.round_idx, draw3_np, deck_np);
+        int action_idx = sfl_choose_action_from_rounds1to4(board_np, st.round_idx, keeps, places, draw3_np, deck_np);
         if (action_idx < 0 || action_idx >= action_count) action_idx = 0;
 
         auto K = keeps.unchecked<2>();
