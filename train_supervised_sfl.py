@@ -287,6 +287,7 @@ def train_supervised(
     max_shards: Optional[int] = None,
     val_split: float = 0.1,
     num_workers: int = 8,
+    checkpoint_path: Optional[str] = None,
 ):
     """
     Train policy network to imitate SFL using supervised learning.
@@ -340,6 +341,21 @@ def train_supervised(
     
     # Model
     model = RLPolicyNet().to(device)
+    
+    # Load checkpoint if provided
+    if checkpoint_path:
+        print(f"[train_supervised] Loading checkpoint from {checkpoint_path}")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                model.load_state_dict(checkpoint["model_state_dict"])
+            else:
+                model.load_state_dict(checkpoint)
+            print(f"[train_supervised] Successfully loaded checkpoint")
+        except Exception as e:
+            print(f"[train_supervised] Warning: Failed to load checkpoint: {e}")
+            print(f"[train_supervised] Starting from scratch")
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
     # Training loop
@@ -496,6 +512,12 @@ def main():
         default=8,
         help="Number of data loader workers.",
     )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint to continue training from.",
+    )
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -512,6 +534,7 @@ def main():
         max_shards=args.max_shards,
         val_split=args.val_split,
         num_workers=args.num_workers,
+        checkpoint_path=args.checkpoint,
     )
 
 
