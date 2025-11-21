@@ -257,6 +257,20 @@ def train_supervised(
                 num_batches_skipped += 1
                 continue
             
+            # Validate labels are within valid action range
+            max_valid_actions = valid_actions_per_sample.max().item()
+            if (batch_labels >= max_valid_actions).any():
+                # Labels out of range - skip this batch
+                num_batches_skipped += 1
+                continue
+            
+            # Also check labels are within each sample's valid range
+            labels_valid = batch_labels < valid_actions_per_sample
+            if not labels_valid.all():
+                # Some labels are out of range for their specific sample
+                num_batches_skipped += 1
+                continue
+            
             # Compute loss
             loss = F.cross_entropy(scores, batch_labels, reduction='mean')
             
