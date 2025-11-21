@@ -1,12 +1,14 @@
 """
 Supervised training on SFL dataset.
 Trains the policy network to imitate SFL's decisions.
+
+This version properly handles action_offsets remapping for train/val splits.
 """
 
 import argparse
 import random
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -17,14 +19,14 @@ from tqdm import tqdm
 from rl_policy_net import RLPolicyNet
 
 
-def load_sfl_dataset(data_dir: str, max_shards: Optional[int] = None):
+def load_sfl_dataset(data_dir: str, max_shards: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Load SFL dataset from shard files.
     
     Returns:
         states: (N, 838) tensor of state encodings
-        labels: (N,) tensor of action indices
-        action_offsets: (N+1,) tensor of offsets into action_encodings
+        labels: (N,) tensor of action indices (long dtype)
+        action_offsets: (N+1,) tensor of offsets into action_encodings (long dtype)
         action_encodings: (M, 838) tensor of all action encodings
     """
     data_path = Path(data_dir)
@@ -60,6 +62,10 @@ def load_sfl_dataset(data_dir: str, max_shards: Optional[int] = None):
         if not isinstance(action_encodings, torch.Tensor):
             action_encodings = torch.from_numpy(action_encodings)
         
+        # Ensure correct dtypes
+        labels = labels.long()  # CrossEntropyLoss requires long
+        action_offsets = action_offsets.long()  # For indexing
+        
         num_states = states.shape[0]
         
         # Adjust offsets for accumulated actions
@@ -84,7 +90,7 @@ def load_sfl_dataset(data_dir: str, max_shards: Optional[int] = None):
     action_offsets_tensor = torch.cat(all_action_offsets, dim=0)  # (total_states,)
     # Add final offset (total number of actions)
     total_actions = sum(enc.shape[0] for enc in all_action_encodings)
-    final_offset = torch.tensor([total_actions], dtype=action_offsets_tensor.dtype, device=action_offsets_tensor.device)
+    final_offset = torch.tensor([total_actions], dtype=torch.long)
     action_offsets_tensor = torch.cat([action_offsets_tensor, final_offset], dim=0)  # (total_states+1,)
     
     action_encodings_tensor = torch.cat(all_action_encodings, dim=0)  # (total_actions, 838)
@@ -94,13 +100,89 @@ def load_sfl_dataset(data_dir: str, max_shards: Optional[int] = None):
     return states_tensor, labels_tensor, action_offsets_tensor, action_encodings_tensor
 
 
+def remap_action_data(
+    indices: torch.Tensor,
+    states: torch.Tensor,
+    labels: torch.Tensor,
+    action_offsets: torch.Tensor,
+    action_encodings: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Remap action data for a subset of states.
+    
+    This function properly remaps action_offsets and action_encodings when taking
+    a subset of states (e.g., for train/val split). The remapped offsets start
+    from 0 and are relative to the remapped action_encodings.
+    
+    Args:
+        indices: (K,) tensor of state indices to include
+        states: (N, 838) original states
+        labels: (N,) original labels
+        action_offsets: (N+1,) original action offsets
+        action_encodings: (M, 838) original action encodings
+    
+    Returns:
+        remapped_states: (K, 838) subset of states
+        remapped_labels: (K,) subset of labels
+        remapped_action_offsets: (K+1,) remapped offsets (starting from 0)
+        remapped_action_encodings: (M', 838) subset of action encodings
+    """
+    indices = indices.long()  # Ensure long for indexing
+    
+    # Get subset of states and labels
+    remapped_states = states[indices]  # (K, 838)
+    remapped_labels = labels[indices]  # (K,)
+    
+    # Collect action encodings for selected states
+    remapped_action_encodings_list = []
+    remapped_action_offsets = [0]  # Start from 0
+    
+    for idx in indices:
+        start = action_offsets[idx].item()
+        end = action_offsets[idx + 1].item()
+        state_actions = action_encodings[start:end]  # (num_actions, 838)
+        remapped_action_encodings_list.append(state_actions)
+        
+        # Update offset: current offset + number of actions for this state
+        next_offset = remapped_action_offsets[-1] + state_actions.shape[0]
+        remapped_action_offsets.append(next_offset)
+    
+    # Concatenate all action encodings
+    remapped_action_encodings = torch.cat(remapped_action_encodings_list, dim=0)  # (M', 838)
+    remapped_action_offsets = torch.tensor(remapped_action_offsets, dtype=torch.long)  # (K+1,)
+    
+    return remapped_states, remapped_labels, remapped_action_offsets, remapped_action_encodings
+
+
 class SFLDataset(Dataset):
     """Dataset for SFL training data."""
-    def __init__(self, states, labels, action_offsets, action_encodings):
+    
+    def __init__(self, states: torch.Tensor, labels: torch.Tensor, action_offsets: torch.Tensor, action_encodings: torch.Tensor):
+        """
+        Args:
+            states: (N, 838) state encodings (on CPU)
+            labels: (N,) action indices (on CPU)
+            action_offsets: (N+1,) offsets into action_encodings (on CPU)
+            action_encodings: (M, 838) action encodings (on CPU)
+        """
         self.states = states  # (N, 838) - on CPU
         self.labels = labels  # (N,)
         self.action_offsets = action_offsets  # (N+1,)
         self.action_encodings = action_encodings  # (M, 838) - on CPU
+        
+        # Validate that labels are within valid range
+        self._validate_labels()
+    
+    def _validate_labels(self):
+        """Validate that all labels are within valid action range."""
+        for i in range(len(self.states)):
+            num_actions = self.action_offsets[i + 1].item() - self.action_offsets[i].item()
+            label = self.labels[i].item()
+            if label < 0 or label >= num_actions:
+                raise ValueError(
+                    f"Invalid label at index {i}: label={label}, num_actions={num_actions}. "
+                    f"This indicates a bug in remap_action_data or data corruption."
+                )
     
     def __len__(self):
         return self.states.shape[0]
@@ -121,7 +203,7 @@ class SFLDataset(Dataset):
 def collate_fn(batch):
     """Collate function to pad actions to same length."""
     states = torch.stack([item['state'] for item in batch], dim=0)  # (B, 838)
-    labels = torch.stack([item['label'] for item in batch], dim=0)  # (B,)
+    labels = torch.stack([item['label'] for item in batch], dim=0)  # (B,) - already tensors
     action_encodings = [item['actions'] for item in batch]
     action_counts = [item['num_actions'] for item in batch]
     
@@ -148,9 +230,31 @@ def collate_fn(batch):
     return states, batch_action_enc, labels, batch_valid_mask, action_counts
 
 
-def create_data_loader(states, labels, action_offsets, action_encodings, batch_size, device, shuffle=True, num_workers=4):
+def create_data_loader(
+    states: torch.Tensor,
+    labels: torch.Tensor,
+    action_offsets: torch.Tensor,
+    action_encodings: torch.Tensor,
+    batch_size: int,
+    device: torch.device,
+    shuffle: bool = True,
+    num_workers: int = 8,
+) -> DataLoader:
     """
     Create a multi-threaded data loader.
+    
+    Args:
+        states: (N, 838) state encodings (on CPU)
+        labels: (N,) labels (on CPU)
+        action_offsets: (N+1,) action offsets (on CPU)
+        action_encodings: (M, 838) action encodings (on CPU)
+        batch_size: Batch size
+        device: Target device (for pin_memory)
+        shuffle: Whether to shuffle
+        num_workers: Number of DataLoader workers
+    
+    Returns:
+        DataLoader instance
     """
     dataset = SFLDataset(states, labels, action_offsets, action_encodings)
     loader = DataLoader(
@@ -184,13 +288,14 @@ def train_supervised(
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if device.type == 'cuda':
+        torch.cuda.manual_seed_all(seed)
     
     # Load dataset
     states, labels, action_offsets, action_encodings = load_sfl_dataset(data_dir, max_shards)
     
     # Keep everything on CPU for DataLoader workers (they can't access CUDA tensors)
     # We'll move batches to GPU in the training loop
-    labels = labels.long()  # CrossEntropyLoss requires long/int64
     # states, labels, action_offsets, action_encodings all stay on CPU
     
     # Train/val split
@@ -198,27 +303,36 @@ def train_supervised(
     num_val = int(num_samples * val_split)
     num_train = num_samples - num_val
     
-    indices = list(range(num_samples))
-    random.shuffle(indices)
+    indices = torch.arange(num_samples, dtype=torch.long)
+    indices = indices[torch.randperm(num_samples)]  # Shuffle
     train_indices = indices[:num_train]
     val_indices = indices[num_train:]
     
-    train_states = states[train_indices]
-    train_labels = labels[train_indices]
-    val_states = states[val_indices]
-    val_labels = labels[val_indices]
+    # Properly remap action data for train and val sets
+    print(f"[train_supervised] Remapping train data ({num_train} states)...")
+    train_states, train_labels, train_action_offsets, train_action_encodings = remap_action_data(
+        train_indices, states, labels, action_offsets, action_encodings
+    )
     
-    # For validation, we need to remap action offsets
-    # This is complex, so for now we'll just use the same offsets (slightly inefficient but works)
+    print(f"[train_supervised] Remapping val data ({num_val} states)...")
+    val_states, val_labels, val_action_offsets, val_action_encodings = remap_action_data(
+        val_indices, states, labels, action_offsets, action_encodings
+    )
+    
     print(f"[train_supervised] Train: {num_train}, Val: {num_val}")
     
     # Create data loaders
-    train_loader = create_data_loader(train_states, train_labels, action_offsets, action_encodings, batch_size, shuffle=True, device=device, num_workers=num_workers)
-    val_loader = create_data_loader(val_states, val_labels, action_offsets, action_encodings, batch_size, shuffle=False, device=device, num_workers=num_workers)
+    train_loader = create_data_loader(
+        train_states, train_labels, train_action_offsets, train_action_encodings,
+        batch_size, device, shuffle=True, num_workers=num_workers
+    )
+    val_loader = create_data_loader(
+        val_states, val_labels, val_action_offsets, val_action_encodings,
+        batch_size, device, shuffle=False, num_workers=num_workers
+    )
     
     # Model
     model = RLPolicyNet().to(device)
-    model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
     # Training loop
@@ -228,7 +342,6 @@ def train_supervised(
         total_correct = 0
         total_samples = 0
         num_batches_processed = 0
-        num_batches_skipped = 0
         
         pbar = tqdm(
             train_loader,
@@ -254,28 +367,15 @@ def train_supervised(
             valid_actions_per_sample = batch_valid_mask.sum(dim=1)  # (B,)
             if (valid_actions_per_sample == 0).any():
                 # Skip this batch if any sample has no valid actions
-                num_batches_skipped += 1
-                if num_batches_skipped == 1:
-                    print(f"[DEBUG] First skip: sample with 0 valid actions")
                 continue
             
-            # Validate labels are within each sample's valid range
-            labels_valid = batch_labels < valid_actions_per_sample
-            if not labels_valid.all():
-                # Some labels are out of range - clamp them to valid range
-                # This fixes corrupted labels in the dataset
-                max_valid = valid_actions_per_sample - 1
-                batch_labels = torch.minimum(batch_labels, max_valid)
-                batch_labels = torch.maximum(batch_labels, torch.zeros_like(batch_labels))
-                if num_batches_skipped == 0:
-                    print(f"[WARNING] Found out-of-range labels, clamping to valid range")
+            # Labels are guaranteed to be valid after proper remapping, no need to check/clamp
             
             # Compute loss
             loss = F.cross_entropy(scores, batch_labels, reduction='mean')
             
             # Check for inf/nan
             if not torch.isfinite(loss):
-                num_batches_skipped += 1
                 continue
             
             num_batches_processed += 1
@@ -301,9 +401,6 @@ def train_supervised(
         avg_loss = total_loss / max(1, num_batches_processed)
         train_acc = 100.0 * total_correct / max(1, total_samples)
         
-        if num_batches_skipped > 0:
-            print(f"[Epoch {epoch+1}] WARNING: Skipped {num_batches_skipped} batches (inf/nan loss or no valid actions)")
-        
         # Validation
         model.eval()
         val_correct = 0
@@ -316,6 +413,7 @@ def train_supervised(
                 batch_action_enc = batch_action_enc.to(device)
                 batch_labels = batch_labels.to(device)
                 batch_valid_mask = batch_valid_mask.to(device)
+                
                 scores = model(batch_states, batch_action_enc)
                 scores = scores.masked_fill(~batch_valid_mask, float('-inf'))
                 preds = scores.argmax(dim=-1)
@@ -412,4 +510,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
