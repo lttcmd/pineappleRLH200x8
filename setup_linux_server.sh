@@ -53,16 +53,20 @@ pip install numpy tqdm pybind11
 
 echo ""
 echo "Step 7: Building C++ extension..."
-cd cpp
+# Build from root directory (CMakeLists.txt is in root)
 mkdir -p build
 cd build
 cmake ..
 cmake --build . --config Release -j$(nproc)
-cd ../..
+cd ..
 
 echo ""
 echo "Step 8: Copying compiled module to root..."
-find . -name "ofc_cpp*.so" -exec cp {} . \; 2>/dev/null || echo "Note: .so file location may vary"
+# The .so file should be in build/cpp/ or similar
+find build -name "ofc_cpp*.so" -exec cp {} . \; 2>/dev/null || {
+    echo "Note: Searching for .so file..."
+    find . -name "ofc_cpp*.so" -type f 2>/dev/null | head -1
+}
 
 echo ""
 echo "Step 9: Testing C++ module import..."

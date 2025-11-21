@@ -90,17 +90,20 @@ cmake --version
 
 ### 4.2 Build the C++ module
 ```bash
-cd cpp
+# Build from root directory (CMakeLists.txt is in root)
 mkdir -p build
 cd build
 cmake ..
 cmake --build . --config Release -j$(nproc)
-cd ../..
+cd ..
 ```
 
 ### 4.3 Verify the build
 ```bash
-# The compiled module should be in the root directory
+# The compiled module should be in build/cpp/ or root directory
+find build -name "ofc_cpp*.so" -exec cp {} . \; 2>/dev/null
+
+# Check if it exists
 ls -la *.so
 # Should see something like: ofc_cpp.cpython-*.so
 
@@ -111,7 +114,9 @@ python3 -c "import ofc_cpp; print('C++ module loaded successfully!')"
 If you see an error about the module not found, you may need to:
 ```bash
 # Copy the .so file to the root directory
-find . -name "ofc_cpp*.so" -exec cp {} . \;
+find build -name "ofc_cpp*.so" -exec cp {} . \;
+# Or search more broadly:
+find . -name "ofc_cpp*.so" -type f
 ```
 
 ## Step 5: Verify Setup
