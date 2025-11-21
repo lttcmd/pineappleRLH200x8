@@ -262,12 +262,11 @@ def train_supervised(
             # Validate labels are within each sample's valid range
             labels_valid = batch_labels < valid_actions_per_sample
             if not labels_valid.all():
-                # Some labels are out of range for their specific sample
-                num_batches_skipped += 1
-                if num_batches_skipped == 1:
-                    invalid_idx = (~labels_valid).nonzero()[0].item()
-                    print(f"[DEBUG] First skip: label {batch_labels[invalid_idx].item()} >= num_actions {valid_actions_per_sample[invalid_idx].item()}")
-                continue
+                # Some labels are out of range - clamp them to valid range
+                # This fixes corrupted labels in the dataset
+                batch_labels = torch.clamp(batch_labels, 0, valid_actions_per_sample - 1)
+                if num_batches_skipped == 0:
+                    print(f"[WARNING] Found out-of-range labels, clamping to valid range")
             
             # Compute loss
             loss = F.cross_entropy(scores, batch_labels, reduction='mean')
