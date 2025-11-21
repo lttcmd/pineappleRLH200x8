@@ -121,7 +121,7 @@ class SFLDataset(Dataset):
 def collate_fn(batch):
     """Collate function to pad actions to same length."""
     states = torch.stack([item['state'] for item in batch], dim=0)  # (B, 838)
-    labels = torch.stack([torch.tensor(item['label']) for item in batch], dim=0)  # (B,)
+    labels = torch.stack([item['label'] for item in batch], dim=0)  # (B,)
     action_encodings = [item['actions'] for item in batch]
     action_counts = [item['num_actions'] for item in batch]
     
@@ -279,8 +279,8 @@ def train_supervised(
                 "acc": f"{100*correct/batch_size_actual:.2f}%",
             })
         
-        avg_loss = total_loss / max(1, len(train_loader))
-        train_acc = 100.0 * total_correct / total_samples
+        avg_loss = total_loss / max(1, len(train_loader)) if len(train_loader) > 0 else 0.0
+        train_acc = 100.0 * total_correct / max(1, total_samples)
         
         # Validation
         model.eval()
