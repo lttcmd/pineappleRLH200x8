@@ -52,7 +52,16 @@ pip install torch torchvision torchaudio
 pip install numpy tqdm pybind11
 
 echo ""
-echo "Step 7: Building C++ extension..."
+echo "Step 7: Verifying include/Rules.hpp exists..."
+if [ ! -f "include/Rules.hpp" ]; then
+    echo "ERROR: include/Rules.hpp not found!"
+    echo "Please ensure the include directory and Rules.hpp file exist."
+    exit 1
+fi
+echo "✓ Found include/Rules.hpp"
+
+echo ""
+echo "Step 8: Building C++ extension..."
 # Build from root directory (CMakeLists.txt is in root)
 mkdir -p build
 cd build
@@ -61,7 +70,7 @@ cmake --build . --config Release -j$(nproc)
 cd ..
 
 echo ""
-echo "Step 8: Copying compiled module to root..."
+echo "Step 9: Copying compiled module to root..."
 # The .so file should be in build/cpp/ or similar
 find build -name "ofc_cpp*.so" -exec cp {} . \; 2>/dev/null || {
     echo "Note: Searching for .so file..."
@@ -69,13 +78,13 @@ find build -name "ofc_cpp*.so" -exec cp {} . \; 2>/dev/null || {
 }
 
 echo ""
-echo "Step 9: Testing C++ module import..."
+echo "Step 10: Testing C++ module import..."
 python3 -c "import ofc_cpp; print('✓ C++ module loaded successfully!')" || {
     echo "⚠ Warning: Could not import ofc_cpp. You may need to manually copy the .so file."
 }
 
 echo ""
-echo "Step 10: Testing SFL heuristics..."
+echo "Step 11: Testing SFL heuristics..."
 python3 simulate_sfl_stats.py --episodes 5 --seed 42 || {
     echo "⚠ Warning: SFL test failed. Check the error above."
 }
