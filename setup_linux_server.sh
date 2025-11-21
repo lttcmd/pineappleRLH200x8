@@ -7,19 +7,21 @@ set -e  # Exit on error
 echo "=== Linux Server Setup Script ==="
 echo ""
 
-# Check if running as root (we'll use sudo instead)
+# Check if running as root - adjust sudo usage accordingly
 if [ "$EUID" -eq 0 ]; then 
-   echo "Please don't run as root. The script will use sudo when needed."
-   exit 1
+   echo "Running as root - will skip sudo for package management"
+   SUDO=""
+else
+   SUDO="sudo"
 fi
 
 echo "Step 1: Updating system packages..."
-sudo apt update
-sudo apt upgrade -y
+$SUDO apt update
+$SUDO apt upgrade -y
 
 echo ""
 echo "Step 2: Installing build tools..."
-sudo apt install -y \
+$SUDO apt install -y \
     build-essential \
     cmake \
     git \
