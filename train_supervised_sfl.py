@@ -361,6 +361,12 @@ def main():
         default=0.1,
         help="Validation split ratio.",
     )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=8,
+        help="Number of data loader workers.",
+    )
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -376,6 +382,7 @@ def main():
         seed=args.seed,
         max_shards=args.max_shards,
         val_split=args.val_split,
+        num_workers=args.num_workers,
     )
 
 
