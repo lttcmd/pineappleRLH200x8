@@ -227,17 +227,17 @@ def train_supervised(
         total_samples = 0
         
         pbar = tqdm(
-            create_data_loader(train_states, train_labels, action_offsets, action_encodings, batch_size, device, shuffle=True),
+            train_loader,
             desc=f"Epoch {epoch+1}/{epochs}",
             total=(num_train + batch_size - 1) // batch_size,
         )
         
         for batch_states, batch_action_enc, batch_labels, batch_valid_mask, batch_action_counts in pbar:
-        # Move to device (DataLoader returns CPU tensors)
-        batch_states = batch_states.to(device)
-        batch_action_enc = batch_action_enc.to(device)
-        batch_labels = batch_labels.to(device)
-        batch_valid_mask = batch_valid_mask.to(device)
+            # Move to device (DataLoader returns CPU tensors)
+            batch_states = batch_states.to(device)
+            batch_action_enc = batch_action_enc.to(device)
+            batch_labels = batch_labels.to(device)
+            batch_valid_mask = batch_valid_mask.to(device)
             batch_size_actual = batch_states.shape[0]
             
             # Get scores for all actions
