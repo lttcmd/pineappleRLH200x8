@@ -264,7 +264,9 @@ def train_supervised(
             if not labels_valid.all():
                 # Some labels are out of range - clamp them to valid range
                 # This fixes corrupted labels in the dataset
-                batch_labels = torch.clamp(batch_labels, 0, valid_actions_per_sample - 1)
+                max_valid = valid_actions_per_sample - 1
+                batch_labels = torch.minimum(batch_labels, max_valid)
+                batch_labels = torch.maximum(batch_labels, torch.zeros_like(batch_labels))
                 if num_batches_skipped == 0:
                     print(f"[WARNING] Found out-of-range labels, clamping to valid range")
             
