@@ -277,7 +277,7 @@ def train_supervised(
                 "acc": f"{100*correct/batch_size_actual:.2f}%",
             })
         
-        avg_loss = total_loss / len(list(create_data_loader(train_states, train_labels, action_offsets, action_encodings, batch_size, device, shuffle=False)))
+        avg_loss = total_loss / max(1, len(train_loader))
         train_acc = 100.0 * total_correct / total_samples
         
         # Validation
@@ -286,10 +286,12 @@ def train_supervised(
         val_total = 0
         
         with torch.no_grad():
-            # Note: action_encodings is on CPU, will be moved to device in create_data_loader
-            for batch_states, batch_action_enc, batch_labels, batch_valid_mask, _ in create_data_loader(
-                val_states, val_labels, action_offsets, action_encodings, batch_size, device, shuffle=False
-            ):
+            for batch_states, batch_action_enc, batch_labels, batch_valid_mask, _ in val_loader:
+                # Move to device (DataLoader returns CPU tensors)
+                batch_states = batch_states.to(device)
+                batch_action_enc = batch_action_enc.to(device)
+                batch_labels = batch_labels.to(device)
+                batch_valid_mask = batch_valid_mask.to(device)
                 scores = model(batch_states, batch_action_enc)
                 scores = scores.masked_fill(~batch_valid_mask, float('-inf'))
                 preds = scores.argmax(dim=-1)
