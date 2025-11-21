@@ -188,12 +188,10 @@ def train_supervised(
     # Load dataset
     states, labels, action_offsets, action_encodings = load_sfl_dataset(data_dir, max_shards)
     
-    # Move to device (keep action_encodings on CPU to save memory)
-    states = states.to(device)
-    labels = labels.to(device).long()  # CrossEntropyLoss requires long/int64
-    action_offsets = action_offsets.to(device)
-    # Keep action_encodings on CPU - we'll move batches to GPU as needed
-    # action_encodings stays on CPU
+    # Keep everything on CPU for DataLoader workers (they can't access CUDA tensors)
+    # We'll move batches to GPU in the training loop
+    labels = labels.long()  # CrossEntropyLoss requires long/int64
+    # states, labels, action_offsets, action_encodings all stay on CPU
     
     # Train/val split
     num_samples = states.shape[0]
